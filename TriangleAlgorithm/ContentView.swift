@@ -49,6 +49,17 @@ func convexHull(of points: [CGPoint]) -> [CGPoint] {
     return lower.dropLast() + upper.dropLast()
 }
 
+// MARK: - Mondrian palette
+
+enum Mondrian {
+    static let white = Color(red: 0.96, green: 0.95, blue: 0.92)
+    static let red = Color(red: 0.87, green: 0.0, blue: 0.0)
+    static let blue = Color(red: 0.13, green: 0.31, blue: 0.58)
+    static let yellow = Color(red: 0.98, green: 0.79, blue: 0.0)
+    static let gray = Color(red: 0.88, green: 0.87, blue: 0.84)
+    static let line = Color(red: 0.1, green: 0.1, blue: 0.1)
+}
+
 // MARK: - Triangle Algorithm (Kalantari)
 
 struct Trajectory: Identifiable {
@@ -57,6 +68,7 @@ struct Trajectory: Identifiable {
     /// True if the iterate got within epsilon of the query point;
     /// false means the final point is a witness (proof of non-membership).
     let converged: Bool
+    /// Fill color of the Mondrian slice between this trajectory and the next.
     let color: Color
 }
 
@@ -126,8 +138,11 @@ struct ContentView: View {
     @State private var dragResolved = false
     @State private var showInfo = false
 
-    private let trajectoryColors: [Color] = [
-        .blue, .green, .orange, .purple, .pink, .teal, .indigo, .brown
+    /// Slice i (between trajectories i and i+1) gets this fill — mostly white
+    /// with sparse primaries, like a Mondrian composition.
+    private let sliceColors: [Color] = [
+        Mondrian.white, Mondrian.red, Mondrian.white, Mondrian.yellow,
+        Mondrian.white, Mondrian.blue, Mondrian.white, Mondrian.gray
     ]
     private let stepsPerSecond: Double = 7
     private let borderInset: CGFloat = 18
@@ -264,8 +279,8 @@ struct ContentView: View {
     private var legend: some View {
         HStack(spacing: 14) {
             HStack(spacing: 5) {
-                RoundedRectangle(cornerRadius: 2)
-                    .fill(.blue)
+                RoundedRectangle(cornerRadius: 1)
+                    .fill(Mondrian.line)
                     .frame(width: 9, height: 9)
                 Text("Start")
             }
@@ -278,7 +293,7 @@ struct ContentView: View {
             HStack(spacing: 5) {
                 Image(systemName: "xmark")
                     .font(.caption.bold())
-                    .foregroundStyle(.red)
+                    .foregroundStyle(Mondrian.line)
                 Text("Witness")
             }
         }
@@ -298,7 +313,7 @@ struct ContentView: View {
             Label("Squares — the 8 starting iterates", systemImage: "square.fill")
                 .foregroundStyle(.secondary)
             Label("✕ — witness: the point is outside", systemImage: "xmark")
-                .foregroundStyle(.red)
+                .foregroundStyle(Mondrian.line)
         }
         .font(.footnote)
     }
@@ -348,7 +363,7 @@ struct ContentView: View {
                 draw(in: &context, size: size, at: timeline.date)
             }
         }
-        .background(Color.gray.opacity(0.08))
+        .background(Mondrian.white)
         .onGeometryChange(for: CGSize.self) { proxy in
             proxy.size
         } action: { newSize in
@@ -415,7 +430,7 @@ struct ContentView: View {
             return Trajectory(
                 points: result.points,
                 converged: result.converged,
-                color: trajectoryColors[index % trajectoryColors.count]
+                color: sliceColors[index % sliceColors.count]
             )
         }
         if animated {
@@ -484,8 +499,15 @@ struct ContentView: View {
     // MARK: Drawing
 
     private func draw(in context: inout GraphicsContext, size: CGSize, at date: Date) {
+        let progress: Double
+        if isAnimating, let start = runStart {
+            progress = max(0, date.timeIntervalSince(start)) * stepsPerSecond
+        } else {
+            progress = .infinity
+        }
+        drawMondrianRegions(in: &context, size: size, upTo: progress)
         drawHull(in: &context)
-        drawTrajectories(in: &context, at: date)
+        drawTrajectories(in: &context, upTo: progress)
         drawHullPoints(in: &context)
         drawQueryPoint(in: &context)
     }
@@ -497,8 +519,7 @@ struct ContentView: View {
         path.move(to: hull[0])
         for point in hull.dropFirst() { path.addLine(to: point) }
         path.closeSubpath()
-        context.fill(path, with: .color(.blue.opacity(0.08)))
-        context.stroke(path, with: .color(.blue.opacity(0.45)), lineWidth: 1.5)
+        context.stroke(path, with: .color(Mondrian.line), lineWidth: 3)
     }
 
     private func drawHullPoints(in context: inout GraphicsContext) {
@@ -522,14 +543,8 @@ struct ContentView: View {
         context.fill(Path(ellipseIn: inner), with: .color(.red))
     }
 
-    private func drawTrajectories(in context: inout GraphicsContext, at date: Date) {
+    private func drawTrajectories(in context: inout GraphicsContext, upTo progress: Double) {
         guard hasRun else { return }
-        let progress: Double
-        if isAnimating, let start = runStart {
-            progress = max(0, date.timeIntervalSince(start)) * stepsPerSecond
-        } else {
-            progress = .infinity
-        }
 
         for trajectory in trajectories {
             let points = trajectory.points
@@ -537,30 +552,24 @@ struct ContentView: View {
 
             // Starting iterate marker (square).
             let square = CGRect(x: first.x - 5, y: first.y - 5, width: 10, height: 10)
-            context.fill(Path(roundedRect: square, cornerRadius: 2), with: .color(trajectory.color))
+            context.fill(Path(roundedRect: square, cornerRadius: 1), with: .color(Mondrian.line))
 
+            // Angular black bars, in the manner of Mondrian's grid lines.
             let (path, tip) = partialPolyline(points, upTo: progress)
             context.stroke(
                 path,
-                with: .color(trajectory.color.opacity(0.75)),
-                style: StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round)
+                with: .color(Mondrian.line),
+                style: StrokeStyle(lineWidth: 4, lineCap: .butt, lineJoin: .miter)
             )
-
-            // Dots at each revealed iterate.
-            let revealedCount = progress.isFinite ? min(points.count, Int(progress) + 1) : points.count
-            for point in points.prefix(revealedCount) {
-                let dot = CGRect(x: point.x - 2, y: point.y - 2, width: 4, height: 4)
-                context.fill(Path(ellipseIn: dot), with: .color(trajectory.color))
-            }
 
             let fullyRevealed = progress >= Double(points.count - 1)
 
             // Glowing tip while the trace is still moving.
             if !fullyRevealed, let tip {
                 let halo = CGRect(x: tip.x - 6, y: tip.y - 6, width: 12, height: 12)
-                context.fill(Path(ellipseIn: halo), with: .color(trajectory.color.opacity(0.35)))
+                context.fill(Path(ellipseIn: halo), with: .color(Mondrian.line.opacity(0.3)))
                 let head = CGRect(x: tip.x - 3.5, y: tip.y - 3.5, width: 7, height: 7)
-                context.fill(Path(ellipseIn: head), with: .color(trajectory.color))
+                context.fill(Path(ellipseIn: head), with: .color(Mondrian.line))
             }
 
             // Witness marker: an ✕ at the final iterate of a non-converged trajectory.
@@ -570,34 +579,71 @@ struct ContentView: View {
                 cross.addLine(to: CGPoint(x: last.x + 6, y: last.y + 6))
                 cross.move(to: CGPoint(x: last.x + 6, y: last.y - 6))
                 cross.addLine(to: CGPoint(x: last.x - 6, y: last.y + 6))
-                context.stroke(cross, with: .color(trajectory.color), lineWidth: 3)
+                context.stroke(cross, with: .color(Mondrian.line), lineWidth: 3)
             }
         }
     }
 
-    /// Polyline through the first `progress` steps, with the tip interpolated
-    /// partway along the current segment for smooth animation.
-    /// Returns the path and the current tip position.
-    private func partialPolyline(_ points: [CGPoint], upTo progress: Double) -> (Path, CGPoint?) {
-        var path = Path()
-        guard points.count >= 2 else { return (path, points.first) }
-        let t = min(progress, Double(points.count - 1))
-        let whole = Int(t)
-        var tip = points[0]
-        path.move(to: points[0])
-        if whole >= 1 {
-            for i in 1...whole { path.addLine(to: points[i]) }
-            tip = points[whole]
+    /// Fills the regions between consecutive trajectories with Mondrian colors.
+    /// Slice i is bounded by trajectory i traced inward, a bridge between the
+    /// two tips, trajectory i+1 traced back outward, and the border segment
+    /// between their start points (consecutive starts always share a screen
+    /// edge, so closing the subpath runs straight along the border).
+    private func drawMondrianRegions(in context: inout GraphicsContext, size: CGSize, upTo progress: Double) {
+        let n = trajectories.count
+        guard hasRun, n >= 2 else { return }
+
+        // Neutral slices first so primaries paint over them where trajectories
+        // cross each other. Nonzero winding keeps self-overlapping slices solid.
+        func isNeutral(_ i: Int) -> Bool {
+            trajectories[i].color == Mondrian.white || trajectories[i].color == Mondrian.gray
         }
-        let fraction = t - Double(whole)
-        if whole < points.count - 1 && fraction > 0 {
+        let order = trajectories.indices.sorted { isNeutral($0) && !isNeutral($1) }
+
+        for i in order {
+            let a = revealedPoints(trajectories[i].points, upTo: progress)
+            let b = revealedPoints(trajectories[(i + 1) % n].points, upTo: progress)
+            guard let aStart = a.first, !b.isEmpty else { continue }
+            var slice = Path()
+            slice.move(to: aStart)
+            for point in a.dropFirst() { slice.addLine(to: point) }
+            for point in b.reversed() { slice.addLine(to: point) }
+            slice.closeSubpath()
+            context.fill(slice, with: .color(trajectories[i].color))
+        }
+
+        // Black frame on the inset rect the traces start from, like a canvas edge.
+        let frame = CGRect(x: borderInset, y: borderInset,
+                           width: size.width - 2 * borderInset,
+                           height: size.height - 2 * borderInset)
+        context.stroke(Path(frame), with: .color(Mondrian.line), lineWidth: 3)
+    }
+
+    /// The iterate points revealed at `progress`, with the tip interpolated
+    /// partway along the current segment for smooth animation.
+    private func revealedPoints(_ points: [CGPoint], upTo progress: Double) -> [CGPoint] {
+        guard points.count >= 2, progress < Double(points.count - 1) else { return points }
+        let whole = max(0, Int(progress))
+        var revealed = Array(points.prefix(whole + 1))
+        let fraction = progress - Double(whole)
+        if fraction > 0 {
             let a = points[whole]
             let b = points[whole + 1]
-            tip = CGPoint(x: a.x + (b.x - a.x) * fraction,
-                          y: a.y + (b.y - a.y) * fraction)
-            path.addLine(to: tip)
+            revealed.append(CGPoint(x: a.x + (b.x - a.x) * fraction,
+                                    y: a.y + (b.y - a.y) * fraction))
         }
-        return (path, tip)
+        return revealed
+    }
+
+    /// Polyline through the revealed points.
+    /// Returns the path and the current tip position.
+    private func partialPolyline(_ points: [CGPoint], upTo progress: Double) -> (Path, CGPoint?) {
+        let revealed = revealedPoints(points, upTo: progress)
+        var path = Path()
+        guard let first = revealed.first else { return (path, nil) }
+        path.move(to: first)
+        for point in revealed.dropFirst() { path.addLine(to: point) }
+        return (path, revealed.last)
     }
 }
 
