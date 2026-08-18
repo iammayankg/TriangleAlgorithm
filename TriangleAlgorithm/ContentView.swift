@@ -49,17 +49,6 @@ func convexHull(of points: [CGPoint]) -> [CGPoint] {
     return lower.dropLast() + upper.dropLast()
 }
 
-// MARK: - Mondrian palette
-
-enum Mondrian {
-    static let white = Color(red: 0.96, green: 0.95, blue: 0.92)
-    static let red = Color(red: 0.87, green: 0.0, blue: 0.0)
-    static let blue = Color(red: 0.13, green: 0.31, blue: 0.58)
-    static let yellow = Color(red: 0.98, green: 0.79, blue: 0.0)
-    static let gray = Color(red: 0.88, green: 0.87, blue: 0.84)
-    static let line = Color(red: 0.1, green: 0.1, blue: 0.1)
-}
-
 // MARK: - Triangle Algorithm (Kalantari)
 
 struct Trajectory: Identifiable {
@@ -68,8 +57,6 @@ struct Trajectory: Identifiable {
     /// True if the iterate got within epsilon of the query point;
     /// false means the final point is a witness (proof of non-membership).
     let converged: Bool
-    /// Fill color of the Mondrian slice between this trajectory and the next.
-    let color: Color
 }
 
 enum TriangleAlgorithm {
@@ -123,6 +110,12 @@ struct ContentView: View {
         case hull(Int)
     }
 
+    /// A rendered poster ready for previewing and the share sheet.
+    struct PosterImage: Identifiable {
+        let id = UUID()
+        let image: Image
+    }
+
     @State private var hullPoints: [CGPoint] = []
     @State private var queryPoint: CGPoint? = nil
 
@@ -137,13 +130,12 @@ struct ContentView: View {
     @State private var activeDrag: DragTarget? = nil
     @State private var dragResolved = false
     @State private var showInfo = false
+    @State private var palette: Palette = .mondrian
+    @State private var soundOn = true
+    @State private var isAmbient = false
+    @State private var poster: PosterImage? = nil
+    @State private var soundEngine = SoundEngine()
 
-    /// Slice i (between trajectories i and i+1) gets this fill — mostly white
-    /// with sparse primaries, like a Mondrian composition.
-    private let sliceColors: [Color] = [
-        Mondrian.white, Mondrian.red, Mondrian.white, Mondrian.yellow,
-        Mondrian.white, Mondrian.blue, Mondrian.white, Mondrian.gray
-    ]
     private let stepsPerSecond: Double = 7
     private let borderInset: CGFloat = 18
     private let grabRadius: CGFloat = 30
@@ -160,17 +152,24 @@ struct ContentView: View {
         ZStack {
             canvas
 
-            if hullPoints.isEmpty {
+            if hullPoints.isEmpty && !isAmbient {
                 emptyStateHint
             }
 
-            VStack(spacing: 12) {
-                topOverlay
-                Spacer()
-                controlBar
+            if isAmbient {
+                ambientHint
+                    .transition(.opacity)
+            } else {
+                VStack(spacing: 12) {
+                    topOverlay
+                    Spacer()
+                    controlBar
+                }
+                .padding()
+                .transition(.opacity)
             }
-            .padding()
         }
+        .animation(.easeInOut(duration: 0.3), value: isAmbient)
         .sensoryFeedback(trigger: isAnimating) { oldValue, newValue in
             guard oldValue && !newValue, let inside = membershipResult else { return nil }
             return inside ? .success : .error
@@ -183,6 +182,20 @@ struct ContentView: View {
             try? await Task.sleep(for: .seconds(duration))
             withAnimation(.spring(duration: 0.4)) { isAnimating = false }
         }
+        .task(id: isAmbient) {
+            // Ambient wallpaper mode: keep composing until the user taps out.
+            guard isAmbient else { return }
+            while isAmbient && !Task.isCancelled {
+                randomExample()
+                let maxSteps = trajectories.map(\.points.count).max() ?? 0
+                let traceDuration = Double(maxSteps) / stepsPerSecond + 0.4
+                // Let the finished composition hang on screen before repainting.
+                try? await Task.sleep(for: .seconds(traceDuration + 3.5))
+            }
+        }
+        .sheet(item: $poster) { poster in
+            posterSheet(for: poster)
+        }
     }
 
     // MARK: Overlays
@@ -193,7 +206,7 @@ struct ContentView: View {
                 .font(.system(size: 44))
             Text("Tap anywhere to add hull points")
                 .font(.headline)
-            Text("Drag the red target to move it, then press Run")
+            Text("Drag the target ring to move it, then press Run")
                 .font(.subheadline)
         }
         .foregroundStyle(.secondary)
@@ -202,12 +215,28 @@ struct ContentView: View {
         .allowsHitTesting(false)
     }
 
+    private var ambientHint: some View {
+        VStack {
+            Spacer()
+            Text("Ambient mode — tap anywhere to exit")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .glassEffect()
+                .padding(.bottom, 30)
+        }
+        .allowsHitTesting(false)
+    }
+
     private var topOverlay: some View {
         VStack(spacing: 10) {
-            HStack(alignment: .top) {
+            HStack(alignment: .top, spacing: 10) {
+                themeMenu
                 Spacer()
                 statusChip
                 Spacer()
+                shareButton
                 infoButton
             }
             if hasRun && !isAnimating {
@@ -248,6 +277,29 @@ struct ContentView: View {
         }
     }
 
+    private var themeMenu: some View {
+        Menu {
+            Picker("Theme", selection: $palette) {
+                ForEach(Palette.all) { palette in
+                    Text(palette.name).tag(palette)
+                }
+            }
+        } label: {
+            Image(systemName: "paintpalette")
+        }
+        .buttonStyle(.glass)
+        .accessibilityLabel("Color theme")
+    }
+
+    private var shareButton: some View {
+        Button(action: sharePoster) {
+            Image(systemName: "square.and.arrow.up")
+        }
+        .buttonStyle(.glass)
+        .disabled(!hasRun || isAnimating)
+        .accessibilityLabel("Export poster")
+    }
+
     private var infoButton: some View {
         Button {
             showInfo.toggle()
@@ -280,20 +332,20 @@ struct ContentView: View {
         HStack(spacing: 14) {
             HStack(spacing: 5) {
                 RoundedRectangle(cornerRadius: 1)
-                    .fill(Mondrian.line)
+                    .fill(palette.line)
                     .frame(width: 9, height: 9)
                 Text("Start")
             }
             HStack(spacing: 5) {
                 Circle()
-                    .strokeBorder(.red, lineWidth: 2)
+                    .strokeBorder(palette.target, lineWidth: 2)
                     .frame(width: 11, height: 11)
                 Text("Target")
             }
             HStack(spacing: 5) {
                 Image(systemName: "xmark")
                     .font(.caption.bold())
-                    .foregroundStyle(Mondrian.line)
+                    .foregroundStyle(palette.line)
                 Text("Witness")
             }
         }
@@ -306,14 +358,14 @@ struct ContentView: View {
 
     private var legendRows: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Label("Blue dots — hull vertices (tap to add, drag to move)", systemImage: "circle.fill")
-                .foregroundStyle(.blue)
-            Label("Red ring — target point (drag to move)", systemImage: "circlebadge")
-                .foregroundStyle(.red)
+            Label("Dots — hull vertices (tap to add, drag to move)", systemImage: "circle.fill")
+                .foregroundStyle(palette.vertex)
+            Label("Ring — target point (drag to move)", systemImage: "circlebadge")
+                .foregroundStyle(palette.target)
             Label("Squares — the 8 starting iterates", systemImage: "square.fill")
                 .foregroundStyle(.secondary)
             Label("✕ — witness: the point is outside", systemImage: "xmark")
-                .foregroundStyle(Mondrian.line)
+                .foregroundStyle(palette.line)
         }
         .font(.footnote)
     }
@@ -337,6 +389,23 @@ struct ContentView: View {
                 }
                 .buttonStyle(.glass)
                 .accessibilityLabel("Random example")
+
+                Button {
+                    isAmbient = true
+                } label: {
+                    Image(systemName: "sparkles")
+                }
+                .buttonStyle(.glass)
+                .accessibilityLabel("Ambient mode")
+
+                Button {
+                    soundOn.toggle()
+                    if !soundOn { soundEngine.stop() }
+                } label: {
+                    Image(systemName: soundOn ? "speaker.wave.2" : "speaker.slash")
+                }
+                .buttonStyle(.glass)
+                .accessibilityLabel(soundOn ? "Mute sound" : "Enable sound")
 
                 Button(action: undo) {
                     Image(systemName: "arrow.uturn.backward")
@@ -363,7 +432,7 @@ struct ContentView: View {
                 draw(in: &context, size: size, at: timeline.date)
             }
         }
-        .background(Mondrian.white)
+        .background(palette.background)
         .onGeometryChange(for: CGSize.self) { proxy in
             proxy.size
         } action: { newSize in
@@ -373,6 +442,10 @@ struct ContentView: View {
             }
         }
         .onTapGesture { location in
+            if isAmbient {
+                isAmbient = false
+                return
+            }
             guard target(near: location) == nil else { return }
             hullPoints.append(location)
             if hasRun { recompute(animated: false) }
@@ -384,6 +457,7 @@ struct ContentView: View {
     private var pointDragGesture: some Gesture {
         DragGesture(minimumDistance: 3)
             .onChanged { value in
+                guard !isAmbient else { return }
                 if !dragResolved {
                     activeDrag = target(near: value.startLocation)
                     dragResolved = true
@@ -425,21 +499,32 @@ struct ContentView: View {
 
     private func recompute(animated: Bool) {
         guard let p = queryPoint, !hullPoints.isEmpty, canvasSize != .zero else { return }
-        trajectories = borderStartPoints(in: canvasSize).enumerated().map { index, start in
+        trajectories = borderStartPoints(in: canvasSize).map { start in
             let result = TriangleAlgorithm.trace(from: start, vertices: hullPoints, target: p)
-            return Trajectory(
-                points: result.points,
-                converged: result.converged,
-                color: sliceColors[index % sliceColors.count]
-            )
+            return Trajectory(points: result.points, converged: result.converged)
         }
         if animated {
             runStart = Date()
             isAnimating = true
+            playRunScore(target: p)
         } else {
             runStart = nil
             isAnimating = false
+            soundEngine.stop()
         }
+    }
+
+    /// Turns the freshly computed trajectories into voices for the sound
+    /// engine: one tick per step, pitched by how close the iterate is.
+    private func playRunScore(target p: CGPoint) {
+        guard soundOn else { return }
+        let voices = trajectories.compactMap { trajectory -> SoundEngine.Voice? in
+            guard let first = trajectory.points.first else { return nil }
+            let initialGap = max(distance(first, p), 1)
+            let gaps = trajectory.points.map { min(1, Double(distance($0, p) / initialGap)) }
+            return SoundEngine.Voice(gaps: gaps, converged: trajectory.converged)
+        }
+        soundEngine.play(voices: voices, stepsPerSecond: stepsPerSecond)
     }
 
     private func undo() {
@@ -459,6 +544,7 @@ struct ContentView: View {
         trajectories = []
         runStart = nil
         isAnimating = false
+        soundEngine.stop()
         if canvasSize != .zero {
             queryPoint = CGPoint(x: canvasSize.width / 2, y: canvasSize.height / 2)
         }
@@ -496,6 +582,62 @@ struct ContentView: View {
         ]
     }
 
+    // MARK: Poster export
+
+    private func sharePoster() {
+        guard hasRun, !isAnimating, canvasSize != .zero else { return }
+        let renderer = ImageRenderer(content: posterContent)
+        renderer.scale = 3
+        guard let uiImage = renderer.uiImage else { return }
+        poster = PosterImage(image: Image(uiImage: uiImage))
+    }
+
+    /// The finished composition matted and captioned like a gallery print.
+    private var posterContent: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Canvas { context, size in
+                draw(in: &context, size: size, at: .now)
+            }
+            .frame(width: canvasSize.width, height: canvasSize.height)
+            .background(palette.background)
+            .border(palette.line, width: 3)
+
+            HStack(alignment: .firstTextBaseline) {
+                Text("TriangleTrace")
+                    .font(.system(.headline, design: .serif))
+                Spacer()
+                Text("\(palette.name) · \(membershipResult == true ? "inside the hull" : "witness found")")
+                    .font(.system(.caption, design: .serif))
+                    .opacity(0.7)
+            }
+            .foregroundStyle(palette.line)
+        }
+        .padding(28)
+        .background(palette.background)
+    }
+
+    private func posterSheet(for poster: PosterImage) -> some View {
+        VStack(spacing: 24) {
+            poster.image
+                .resizable()
+                .scaledToFit()
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .shadow(color: .black.opacity(0.25), radius: 14, y: 6)
+                .padding(.horizontal, 24)
+
+            ShareLink(
+                item: poster.image,
+                preview: SharePreview("TriangleTrace — \(palette.name)", image: poster.image)
+            ) {
+                Label("Share poster", systemImage: "square.and.arrow.up")
+                    .frame(minWidth: 160)
+            }
+            .buttonStyle(.glassProminent)
+        }
+        .padding(.vertical, 28)
+        .presentationDetents([.medium, .large])
+    }
+
     // MARK: Drawing
 
     private func draw(in context: inout GraphicsContext, size: CGSize, at date: Date) {
@@ -519,7 +661,7 @@ struct ContentView: View {
         path.move(to: hull[0])
         for point in hull.dropFirst() { path.addLine(to: point) }
         path.closeSubpath()
-        context.stroke(path, with: .color(Mondrian.line), lineWidth: 3)
+        context.stroke(path, with: .color(palette.line), lineWidth: 3)
     }
 
     private func drawHullPoints(in context: inout GraphicsContext) {
@@ -527,8 +669,8 @@ struct ContentView: View {
             let radius: CGFloat = activeDrag == .hull(index) ? 9 : 6
             let rect = CGRect(x: point.x - radius, y: point.y - radius,
                               width: radius * 2, height: radius * 2)
-            context.fill(Path(ellipseIn: rect), with: .color(.blue))
-            context.stroke(Path(ellipseIn: rect), with: .color(.white), lineWidth: 2)
+            context.fill(Path(ellipseIn: rect), with: .color(palette.vertex))
+            context.stroke(Path(ellipseIn: rect), with: .color(palette.background), lineWidth: 2)
         }
     }
 
@@ -537,10 +679,10 @@ struct ContentView: View {
         let radius: CGFloat = activeDrag == .query ? 13 : 10
         let outer = CGRect(x: p.x - radius, y: p.y - radius,
                            width: radius * 2, height: radius * 2)
-        context.fill(Path(ellipseIn: outer), with: .color(.white.opacity(0.85)))
-        context.stroke(Path(ellipseIn: outer), with: .color(.red), lineWidth: 3)
+        context.fill(Path(ellipseIn: outer), with: .color(palette.background.opacity(0.85)))
+        context.stroke(Path(ellipseIn: outer), with: .color(palette.target), lineWidth: 3)
         let inner = CGRect(x: p.x - 3.5, y: p.y - 3.5, width: 7, height: 7)
-        context.fill(Path(ellipseIn: inner), with: .color(.red))
+        context.fill(Path(ellipseIn: inner), with: .color(palette.target))
     }
 
     private func drawTrajectories(in context: inout GraphicsContext, upTo progress: Double) {
@@ -552,13 +694,13 @@ struct ContentView: View {
 
             // Starting iterate marker (square).
             let square = CGRect(x: first.x - 5, y: first.y - 5, width: 10, height: 10)
-            context.fill(Path(roundedRect: square, cornerRadius: 1), with: .color(Mondrian.line))
+            context.fill(Path(roundedRect: square, cornerRadius: 1), with: .color(palette.line))
 
-            // Angular black bars, in the manner of Mondrian's grid lines.
+            // Angular bars, in the manner of the painter's grid lines.
             let (path, tip) = partialPolyline(points, upTo: progress)
             context.stroke(
                 path,
-                with: .color(Mondrian.line),
+                with: .color(palette.line),
                 style: StrokeStyle(lineWidth: 4, lineCap: .butt, lineJoin: .miter)
             )
 
@@ -567,9 +709,9 @@ struct ContentView: View {
             // Glowing tip while the trace is still moving.
             if !fullyRevealed, let tip {
                 let halo = CGRect(x: tip.x - 6, y: tip.y - 6, width: 12, height: 12)
-                context.fill(Path(ellipseIn: halo), with: .color(Mondrian.line.opacity(0.3)))
+                context.fill(Path(ellipseIn: halo), with: .color(palette.line.opacity(0.3)))
                 let head = CGRect(x: tip.x - 3.5, y: tip.y - 3.5, width: 7, height: 7)
-                context.fill(Path(ellipseIn: head), with: .color(Mondrian.line))
+                context.fill(Path(ellipseIn: head), with: .color(palette.line))
             }
 
             // Witness marker: an ✕ at the final iterate of a non-converged trajectory.
@@ -579,44 +721,45 @@ struct ContentView: View {
                 cross.addLine(to: CGPoint(x: last.x + 6, y: last.y + 6))
                 cross.move(to: CGPoint(x: last.x + 6, y: last.y - 6))
                 cross.addLine(to: CGPoint(x: last.x - 6, y: last.y + 6))
-                context.stroke(cross, with: .color(Mondrian.line), lineWidth: 3)
+                context.stroke(cross, with: .color(palette.line), lineWidth: 3)
             }
         }
     }
 
-    /// Fills the regions between consecutive trajectories with Mondrian colors.
-    /// Slice i is bounded by trajectory i traced inward, a bridge between the
-    /// two tips, trajectory i+1 traced back outward, and the border segment
-    /// between their start points (consecutive starts always share a screen
-    /// edge, so closing the subpath runs straight along the border).
+    /// Fills the regions between consecutive trajectories with the palette's
+    /// slice colors. Slice i is bounded by trajectory i traced inward, a
+    /// bridge between the two tips, trajectory i+1 traced back outward, and
+    /// the border segment between their start points (consecutive starts
+    /// always share a screen edge, so closing the subpath runs straight
+    /// along the border).
     private func drawMondrianRegions(in context: inout GraphicsContext, size: CGSize, upTo progress: Double) {
         let n = trajectories.count
         guard hasRun, n >= 2 else { return }
 
-        // Neutral slices first so primaries paint over them where trajectories
+        // Neutral slices first so accents paint over them where trajectories
         // cross each other. Nonzero winding keeps self-overlapping slices solid.
-        func isNeutral(_ i: Int) -> Bool {
-            trajectories[i].color == Mondrian.white || trajectories[i].color == Mondrian.gray
+        func slice(_ i: Int) -> PaletteSlice {
+            palette.slices[i % palette.slices.count]
         }
-        let order = trajectories.indices.sorted { isNeutral($0) && !isNeutral($1) }
+        let order = trajectories.indices.sorted { slice($0).isNeutral && !slice($1).isNeutral }
 
         for i in order {
             let a = revealedPoints(trajectories[i].points, upTo: progress)
             let b = revealedPoints(trajectories[(i + 1) % n].points, upTo: progress)
             guard let aStart = a.first, !b.isEmpty else { continue }
-            var slice = Path()
-            slice.move(to: aStart)
-            for point in a.dropFirst() { slice.addLine(to: point) }
-            for point in b.reversed() { slice.addLine(to: point) }
-            slice.closeSubpath()
-            context.fill(slice, with: .color(trajectories[i].color))
+            var path = Path()
+            path.move(to: aStart)
+            for point in a.dropFirst() { path.addLine(to: point) }
+            for point in b.reversed() { path.addLine(to: point) }
+            path.closeSubpath()
+            context.fill(path, with: .color(slice(i).color))
         }
 
-        // Black frame on the inset rect the traces start from, like a canvas edge.
+        // Frame on the inset rect the traces start from, like a canvas edge.
         let frame = CGRect(x: borderInset, y: borderInset,
                            width: size.width - 2 * borderInset,
                            height: size.height - 2 * borderInset)
-        context.stroke(Path(frame), with: .color(Mondrian.line), lineWidth: 3)
+        context.stroke(Path(frame), with: .color(palette.line), lineWidth: 3)
     }
 
     /// The iterate points revealed at `progress`, with the tip interpolated
