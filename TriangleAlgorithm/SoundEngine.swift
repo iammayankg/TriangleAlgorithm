@@ -27,7 +27,7 @@ final class SoundEngine {
         guard isReady else { return }
         player.stop()
         player.scheduleBuffer(buffer, at: nil, options: .interrupts)
-        player.play()
+        try? player.playAudio()
     }
 
     func stop() {
@@ -45,7 +45,7 @@ final class SoundEngine {
             try AVAudioSession.sharedInstance().setActive(true)
 #endif
             engine.attach(player)
-            engine.connect(
+            try engine.connectNode(
                 player,
                 to: engine.mainMixerNode,
                 format: AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1)
