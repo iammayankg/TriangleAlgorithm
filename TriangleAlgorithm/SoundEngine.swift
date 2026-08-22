@@ -44,7 +44,7 @@ final class SoundEngine {
     private func playNow(_ buffer: AVAudioPCMBuffer) {
         player.stop()
         player.scheduleBuffer(buffer, at: nil, options: .interrupts)
-        try? player.playAudio()
+        player.play()
     }
 
     /// Starts the audio engine lazily so the app makes no sound at all until
@@ -56,9 +56,13 @@ final class SoundEngine {
         Task {
             var sessionReady = true
 #if os(iOS)
+            // Configure and activate off the main thread; synchronous
+            // activation on the main thread can stall the UI.
             do {
-                try AVAudioSession.sharedInstance().setCategory(.ambient, options: .mixWithOthers)
-                try await AVAudioSession.sharedInstance().activate(options: [])
+                try await Task.detached(priority: .userInitiated) {
+                    try AVAudioSession.sharedInstance().setCategory(.ambient, options: .mixWithOthers)
+                    try AVAudioSession.sharedInstance().setActive(true)
+                }.value
             } catch {
                 sessionReady = false
             }
@@ -75,7 +79,7 @@ final class SoundEngine {
         }
         do {
             engine.attach(player)
-            try engine.connectNode(
+            engine.connect(
                 player,
                 to: engine.mainMixerNode,
                 format: AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1)
