@@ -20,30 +20,60 @@ final class SoundEngine {
     /// Never synthesize more than this much audio for one run.
     private let maxScoreDuration: Double = 30
     private var isReady = false
+    private var isPreparing = false
+    /// Score waiting for the session to finish activating; the first run's
+    /// audio starts as soon as preparation completes.
+    private var pendingBuffer: AVAudioPCMBuffer?
 
     func play(voices: [Voice], stepsPerSecond: Double) {
         guard let buffer = renderScore(voices: voices, stepsPerSecond: stepsPerSecond) else { return }
-        prepareIfNeeded()
+        if isReady {
+            playNow(buffer)
+        } else {
+            pendingBuffer = buffer
+            prepareIfNeeded()
+        }
+    }
+
+    func stop() {
+        pendingBuffer = nil
         guard isReady else { return }
+        player.stop()
+    }
+
+    private func playNow(_ buffer: AVAudioPCMBuffer) {
         player.stop()
         player.scheduleBuffer(buffer, at: nil, options: .interrupts)
         try? player.playAudio()
     }
 
-    func stop() {
-        guard isReady else { return }
-        player.stop()
+    /// Starts the audio engine lazily so the app makes no sound at all until
+    /// the first audible run. The session activates asynchronously: doing it
+    /// synchronously on the main thread can stall the UI.
+    private func prepareIfNeeded() {
+        guard !isReady, !isPreparing else { return }
+        isPreparing = true
+        Task {
+            var sessionReady = true
+#if os(iOS)
+            do {
+                try AVAudioSession.sharedInstance().setCategory(.ambient, options: .mixWithOthers)
+                try await AVAudioSession.sharedInstance().activate(options: [])
+            } catch {
+                sessionReady = false
+            }
+#endif
+            finishPreparing(sessionReady: sessionReady)
+        }
     }
 
-    /// Starts the audio engine lazily so the app makes no sound at all
-    /// until the first audible run.
-    private func prepareIfNeeded() {
-        guard !isReady else { return }
+    private func finishPreparing(sessionReady: Bool) {
+        isPreparing = false
+        guard sessionReady else {
+            pendingBuffer = nil
+            return
+        }
         do {
-#if os(iOS)
-            try AVAudioSession.sharedInstance().setCategory(.ambient, options: .mixWithOthers)
-            try AVAudioSession.sharedInstance().setActive(true)
-#endif
             engine.attach(player)
             try engine.connectNode(
                 player,
@@ -52,8 +82,13 @@ final class SoundEngine {
             )
             try engine.start()
             isReady = true
+            if let buffer = pendingBuffer {
+                pendingBuffer = nil
+                playNow(buffer)
+            }
         } catch {
             isReady = false
+            pendingBuffer = nil
         }
     }
 
