@@ -49,6 +49,43 @@ func convexHull(of points: [CGPoint]) -> [CGPoint] {
     return lower.dropLast() + upper.dropLast()
 }
 
+/// True if `point` lies inside or on the boundary of the convex polygon `hull`.
+func isInsideConvexHull(_ point: CGPoint, hull: [CGPoint]) -> Bool {
+    guard hull.count >= 3 else { return false }
+    var sign: CGFloat = 0
+    for i in hull.indices {
+        let a = hull[i]
+        let b = hull[(i + 1) % hull.count]
+        let cross = (b.x - a.x) * (point.y - a.y) - (b.y - a.y) * (point.x - a.x)
+        if cross != 0 {
+            if sign == 0 {
+                sign = cross > 0 ? 1 : -1
+            } else if (cross > 0 ? 1 : -1) != sign {
+                return false
+            }
+        }
+    }
+    return true
+}
+
+/// `point` unchanged if it's inside `hull`; otherwise the nearest point on
+/// the hull's boundary.
+func clampToConvexHull(_ point: CGPoint, hull: [CGPoint]) -> CGPoint {
+    guard hull.count >= 3 else { return hull.first ?? point }
+    if isInsideConvexHull(point, hull: hull) { return point }
+    var best = hull[0]
+    var bestGap = CGFloat.greatestFiniteMagnitude
+    for i in hull.indices {
+        let candidate = closestPointOnSegment(from: hull[i], to: hull[(i + 1) % hull.count], target: point)
+        let gap = distance(candidate, point)
+        if gap < bestGap {
+            bestGap = gap
+            best = candidate
+        }
+    }
+    return best
+}
+
 // MARK: - Triangle Algorithm (Kalantari)
 
 struct Trajectory: Identifiable {
@@ -108,12 +145,33 @@ struct ContentView: View {
     enum DragTarget: Hashable {
         case query
         case hull(Int)
+        case start(Int)
     }
 
     /// A rendered poster ready for previewing and the share sheet.
+    /// The identity is stable so re-rendering at a new resolution updates
+    /// the presented sheet in place instead of dismissing and re-presenting.
     struct PosterImage: Identifiable {
-        let id = UUID()
+        var id: String { "poster" }
         let image: Image
+        let pixelSize: CGSize
+    }
+
+    /// Render scale for poster export, as a multiple of the on-screen size.
+    enum ExportResolution: String, CaseIterable, Identifiable {
+        case standard = "2×"
+        case high = "4×"
+        case ultra = "8×"
+
+        var id: String { rawValue }
+
+        var scale: CGFloat {
+            switch self {
+            case .standard: 2
+            case .high: 4
+            case .ultra: 8
+            }
+        }
     }
 
     @State private var hullPoints: [CGPoint] = []
@@ -131,9 +189,18 @@ struct ContentView: View {
     @State private var dragResolved = false
     @State private var showInfo = false
     @State private var palette: Palette = .mondrian
+    @State private var coloringMode: ColoringMode = .palette
+    @State private var iterateScheme: IterateScheme = .border
+    @State private var startPoints: [CGPoint] = []
+    @State private var isEditingIterates = false
+    @State private var showAddHullPointsAlert = false
+    @State private var showOutsideHullWarning = false
+    @State private var outsideHullWarningNonce = 0
     @State private var soundOn = true
     @State private var isAmbient = false
     @State private var poster: PosterImage? = nil
+    @State private var exportResolution: ExportResolution = .high
+    @State private var isRenderingPoster = false
     @State private var soundEngine = SoundEngine()
 
     private let stepsPerSecond: Double = 7
@@ -152,7 +219,7 @@ struct ContentView: View {
         ZStack {
             canvas
 
-            if hullPoints.isEmpty && !isAmbient {
+            if hullPoints.isEmpty && !isAmbient && !isEditingIterates {
                 emptyStateHint
             }
 
@@ -192,6 +259,27 @@ struct ContentView: View {
                 // Let the finished composition hang on screen before repainting.
                 try? await Task.sleep(for: .seconds(traceDuration + 3.5))
             }
+        }
+        .sensoryFeedback(.warning, trigger: outsideHullWarningNonce)
+        .task(id: outsideHullWarningNonce) {
+            // Auto-dismiss the outside-the-hull warning; the nonce restarts
+            // the timer when the user keeps tapping outside.
+            guard showOutsideHullWarning else { return }
+            try? await Task.sleep(for: .seconds(2))
+            withAnimation(.easeInOut(duration: 0.3)) { showOutsideHullWarning = false }
+        }
+        .onChange(of: soundOn) { _, isOn in
+            if !isOn { soundEngine.stop() }
+        }
+        .onChange(of: iterateScheme) { _, newScheme in
+            guard let points = newScheme.points(inHull: convexHull(of: hullPoints)) else { return }
+            startPoints = points
+            if hasRun { recompute(animated: false) }
+        }
+        .alert("Add hull points first", isPresented: $showAddHullPointsAlert) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text("Place at least three points to form a hull, then edit the iterates inside it.")
         }
         .sheet(item: $poster) { poster in
             posterSheet(for: poster)
@@ -233,12 +321,14 @@ struct ContentView: View {
         VStack(spacing: 10) {
             HStack(alignment: .top, spacing: 10) {
                 themeMenu
-                Spacer()
-                statusChip
+                iterateMenu
                 Spacer()
                 shareButton
                 infoButton
             }
+            // The chip gets its own row so its text never fights the
+            // buttons for width on small screens.
+            statusChip
             if hasRun && !isAnimating {
                 legend
                     .transition(.opacity.combined(with: .move(edge: .top)))
@@ -250,7 +340,29 @@ struct ContentView: View {
 
     @ViewBuilder
     private var statusChip: some View {
-        if let inside = membershipResult, !isAnimating {
+        if isEditingIterates && !isAnimating {
+            HStack(spacing: 12) {
+                if showOutsideHullWarning {
+                    Label("Place iterates inside the hull", systemImage: "exclamationmark.triangle.fill")
+                } else {
+                    Label("Iterates: tap to add, drag to move", systemImage: "square.and.pencil")
+                    Button("Clear", role: .destructive) {
+                        clearIterates()
+                    }
+                    .disabled(startPoints.isEmpty)
+                    Button("Done") {
+                        isEditingIterates = false
+                    }
+                    .font(.subheadline.bold())
+                }
+            }
+            .font(.subheadline)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .glassEffect(showOutsideHullWarning
+                         ? .regular.tint(Color.orange.opacity(0.45))
+                         : .regular)
+        } else if let inside = membershipResult, !isAnimating {
             Label(
                 inside ? "Inside the convex hull" : "Outside — witness found",
                 systemImage: inside ? "checkmark.seal.fill" : "xmark.seal.fill"
@@ -260,14 +372,14 @@ struct ContentView: View {
             .padding(.vertical, 10)
             .glassEffect(.regular.tint(inside ? Color.green.opacity(0.45) : Color.red.opacity(0.45)))
         } else if isAnimating {
-            Label("Tracing 8 trajectories…", systemImage: "point.bottomleft.forward.to.point.topright.scurvepath")
+            Label("Tracing \(trajectories.count) trajectories…", systemImage: "point.bottomleft.forward.to.point.topright.scurvepath")
                 .font(.subheadline)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 8)
                 .glassEffect()
         } else if !hullPoints.isEmpty {
             Text(hullPoints.count < 3
-                 ? "\(hullPoints.count) point\(hullPoints.count == 1 ? "" : "s") — add more, or press Run"
+                 ? "\(hullPoints.count) point\(hullPoints.count == 1 ? "" : "s") — add at least 3"
                  : "\(hullPoints.count) points — press Run")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
@@ -284,6 +396,12 @@ struct ContentView: View {
                     Text(palette.name).tag(palette)
                 }
             }
+            Divider()
+            Picker("Coloring", selection: $coloringMode) {
+                ForEach(ColoringMode.allCases) { mode in
+                    Text(mode.rawValue).tag(mode)
+                }
+            }
         } label: {
             Image(systemName: "paintpalette")
         }
@@ -291,13 +409,58 @@ struct ContentView: View {
         .accessibilityLabel("Color theme")
     }
 
-    private var shareButton: some View {
-        Button(action: sharePoster) {
-            Image(systemName: "square.and.arrow.up")
+    private var iterateMenu: some View {
+        Menu {
+            Picker("Iterates", selection: $iterateScheme) {
+                Section("Deterministic") {
+                    Text(IterateScheme.border.name).tag(IterateScheme.border)
+                    Text(IterateScheme.corners.name).tag(IterateScheme.corners)
+                }
+                Section("Patterned") {
+                    Text(IterateScheme.ring.name).tag(IterateScheme.ring)
+                    Text(IterateScheme.grid.name).tag(IterateScheme.grid)
+                    Text(IterateScheme.spiral.name).tag(IterateScheme.spiral)
+                }
+                Section {
+                    Text(IterateScheme.random.name).tag(IterateScheme.random)
+                    Text(IterateScheme.custom.name).tag(IterateScheme.custom)
+                }
+            }
+            Divider()
+            Toggle("Edit iterates", isOn: editIteratesBinding)
+        } label: {
+            Image(systemName: "square.grid.3x3.topleft.filled")
         }
         .buttonStyle(.glass)
-        .disabled(!hasRun || isAnimating)
-        .accessibilityLabel("Export poster")
+        .accessibilityLabel("Iterate scheme")
+    }
+
+    /// Gates edit mode behind having a hull to edit inside: without at least
+    /// three hull points there is no interior for the iterates to live in.
+    private var editIteratesBinding: Binding<Bool> {
+        Binding(
+            get: { isEditingIterates },
+            set: { wantsOn in
+                if wantsOn && convexHull(of: hullPoints).count < 3 {
+                    showAddHullPointsAlert = true
+                } else {
+                    isEditingIterates = wantsOn
+                }
+            }
+        )
+    }
+
+    private var shareButton: some View {
+        Button(action: sharePoster) {
+            if isRenderingPoster {
+                ProgressView()
+            } else {
+                Image(systemName: "square.and.arrow.up")
+            }
+        }
+        .buttonStyle(.glass)
+        .disabled(!hasRun || isAnimating || isRenderingPoster)
+        .accessibilityLabel(isRenderingPoster ? "Rendering poster" : "Export poster")
     }
 
     private var infoButton: some View {
@@ -318,7 +481,7 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Kalantari's Triangle Algorithm")
                 .font(.headline)
-            Text("Eight iterates start from the corners and edge midpoints of the screen. Each step finds a pivot vertex v with d(x, v) ≥ d(p, v) and jumps to the point on the segment [x, v] closest to the target p.")
+            Text("Iterates start from a configurable set of points inside the convex hull — its vertices and edge midpoints by default. Each step finds a pivot vertex v with d(x, v) ≥ d(p, v) and jumps to the point on the segment [x, v] closest to the target p.")
             Text("If an iterate gets within ε of the target, the point is in the hull. If no pivot exists, the iterate is a witness — proof the point is outside.")
             Divider()
             legendRows
@@ -362,7 +525,7 @@ struct ContentView: View {
                 .foregroundStyle(palette.vertex)
             Label("Ring — target point (drag to move)", systemImage: "circlebadge")
                 .foregroundStyle(palette.target)
-            Label("Squares — the 8 starting iterates", systemImage: "square.fill")
+            Label("Squares — the starting iterates (pick a scheme or edit them)", systemImage: "square.fill")
                 .foregroundStyle(.secondary)
             Label("✕ — witness: the point is outside", systemImage: "xmark")
                 .foregroundStyle(palette.line)
@@ -382,7 +545,7 @@ struct ContentView: View {
                         .frame(minWidth: 90)
                 }
                 .buttonStyle(.glassProminent)
-                .disabled(hullPoints.isEmpty || queryPoint == nil || isAnimating)
+                .disabled(hullPoints.isEmpty || queryPoint == nil || startPoints.isEmpty || isAnimating)
 
                 Button(action: randomExample) {
                     Image(systemName: "die.face.5")
@@ -390,38 +553,40 @@ struct ContentView: View {
                 .buttonStyle(.glass)
                 .accessibilityLabel("Random example")
 
-                Button {
-                    isAmbient = true
-                } label: {
-                    Image(systemName: "sparkles")
-                }
-                .buttonStyle(.glass)
-                .accessibilityLabel("Ambient mode")
-
-                Button {
-                    soundOn.toggle()
-                    if !soundOn { soundEngine.stop() }
-                } label: {
-                    Image(systemName: soundOn ? "speaker.wave.2" : "speaker.slash")
-                }
-                .buttonStyle(.glass)
-                .accessibilityLabel(soundOn ? "Mute sound" : "Enable sound")
-
                 Button(action: undo) {
                     Image(systemName: "arrow.uturn.backward")
                 }
                 .buttonStyle(.glass)
-                .disabled(hullPoints.isEmpty)
-                .accessibilityLabel("Undo last point")
+                .disabled(isEditingIterates ? startPoints.isEmpty : hullPoints.isEmpty)
+                .accessibilityLabel(isEditingIterates ? "Undo last iterate" : "Undo last point")
 
-                Button(role: .destructive, action: clearAll) {
-                    Image(systemName: "trash")
-                }
-                .buttonStyle(.glass)
-                .disabled(hullPoints.isEmpty && !hasRun)
-                .accessibilityLabel("Clear all points")
+                moreMenu
             }
         }
+    }
+
+    /// Secondary actions folded into one overflow button so the bar stays
+    /// uncrowded on small screens.
+    private var moreMenu: some View {
+        Menu {
+            Button {
+                isAmbient = true
+            } label: {
+                Label("Ambient mode", systemImage: "sparkles")
+            }
+            Toggle(isOn: $soundOn) {
+                Label("Sound", systemImage: soundOn ? "speaker.wave.2" : "speaker.slash")
+            }
+            Divider()
+            Button(role: .destructive, action: clearAll) {
+                Label("Clear all points", systemImage: "trash")
+            }
+            .disabled(hullPoints.isEmpty && !hasRun)
+        } label: {
+            Image(systemName: "ellipsis")
+        }
+        .buttonStyle(.glass)
+        .accessibilityLabel("More options")
     }
 
     // MARK: Canvas & gestures
@@ -440,6 +605,11 @@ struct ContentView: View {
             if queryPoint == nil, newSize != .zero {
                 queryPoint = CGPoint(x: newSize.width / 2, y: newSize.height / 2)
             }
+            // Iterates are hull-relative, so a size change only matters for
+            // seeding them once a hull exists (e.g. in seeded previews).
+            if newSize != .zero, startPoints.isEmpty {
+                syncIteratesToHull()
+            }
         }
         .onTapGesture { location in
             if isAmbient {
@@ -447,7 +617,22 @@ struct ContentView: View {
                 return
             }
             guard target(near: location) == nil else { return }
-            hullPoints.append(location)
+            if isEditingIterates {
+                let hull = convexHull(of: hullPoints)
+                guard hull.count >= 3 else { return }
+                // Iterates live inside the hull; a tap outside is rejected
+                // with a transient warning rather than silently moved.
+                guard isInsideConvexHull(location, hull: hull) else {
+                    withAnimation(.spring(duration: 0.3)) { showOutsideHullWarning = true }
+                    outsideHullWarningNonce += 1
+                    return
+                }
+                startPoints.append(location)
+                iterateScheme = .custom
+            } else {
+                hullPoints.append(location)
+                syncIteratesToHull()
+            }
             if hasRun { recompute(animated: false) }
         }
         .gesture(pointDragGesture)
@@ -468,6 +653,10 @@ struct ContentView: View {
                     queryPoint = value.location
                 case .hull(let index) where hullPoints.indices.contains(index):
                     hullPoints[index] = value.location
+                    syncIteratesToHull()
+                case .start(let index) where startPoints.indices.contains(index):
+                    startPoints[index] = clampToConvexHull(value.location, hull: convexHull(of: hullPoints))
+                    iterateScheme = .custom
                 default:
                     break
                 }
@@ -492,14 +681,54 @@ struct ContentView: View {
                 best = (.hull(index), gap)
             }
         }
+        // Start points only participate while the user is editing iterates,
+        // so the border squares never hijack hull or target drags.
+        if isEditingIterates {
+            for (index, point) in startPoints.enumerated() {
+                let gap = distance(point, location)
+                if gap <= grabRadius && gap < (best?.gap ?? .greatestFiniteMagnitude) {
+                    best = (.start(index), gap)
+                }
+            }
+        }
         return best?.target
     }
 
     // MARK: Actions
 
+    /// Keeps the iterate set consistent with the current hull: scheme-based
+    /// sets regenerate from the hull's geometry, while custom and random
+    /// layouts keep their shape and just get strays clamped back inside.
+    /// With fewer than three hull points there is no interior, so the set
+    /// empties until a hull exists.
+    private func syncIteratesToHull() {
+        let hull = convexHull(of: hullPoints)
+        guard hull.count >= 3 else {
+            startPoints = []
+            return
+        }
+        if iterateScheme == .custom || iterateScheme.isRandom {
+            if startPoints.isEmpty, let generated = iterateScheme.points(inHull: hull) {
+                startPoints = generated
+            } else {
+                startPoints = startPoints.map { clampToConvexHull($0, hull: hull) }
+            }
+        } else if let generated = iterateScheme.points(inHull: hull) {
+            startPoints = generated
+        }
+    }
+
     private func recompute(animated: Bool) {
         guard let p = queryPoint, !hullPoints.isEmpty, canvasSize != .zero else { return }
-        trajectories = borderStartPoints(in: canvasSize).map { start in
+        // A random scheme samples a fresh set on every animated run, so each
+        // Run/Replay composes a new picture.
+        if animated, iterateScheme.isRandom,
+           let fresh = iterateScheme.points(inHull: convexHull(of: hullPoints)),
+           !fresh.isEmpty {
+            startPoints = fresh
+        }
+        guard !startPoints.isEmpty else { return }
+        trajectories = startPoints.map { start in
             let result = TriangleAlgorithm.trace(from: start, vertices: hullPoints, target: p)
             return Trajectory(points: result.points, converged: result.converged)
         }
@@ -528,9 +757,23 @@ struct ContentView: View {
     }
 
     private func undo() {
+        if isEditingIterates {
+            guard !startPoints.isEmpty else { return }
+            startPoints.removeLast()
+            iterateScheme = .custom
+            if startPoints.isEmpty {
+                trajectories = []
+                runStart = nil
+                isAnimating = false
+            } else if hasRun {
+                recompute(animated: false)
+            }
+            return
+        }
         guard !hullPoints.isEmpty else { return }
         hullPoints.removeLast()
-        if hullPoints.isEmpty {
+        syncIteratesToHull()
+        if hullPoints.isEmpty || startPoints.isEmpty {
             trajectories = []
             runStart = nil
             isAnimating = false
@@ -539,11 +782,24 @@ struct ContentView: View {
         }
     }
 
+    /// Empties the iterate set so the user can place a fresh one by hand.
+    /// The trajectories go with it — they were traced from the old starts.
+    private func clearIterates() {
+        startPoints = []
+        iterateScheme = .custom
+        trajectories = []
+        runStart = nil
+        isAnimating = false
+        soundEngine.stop()
+    }
+
     private func clearAll() {
         hullPoints = []
         trajectories = []
         runStart = nil
         isAnimating = false
+        isEditingIterates = false
+        syncIteratesToHull()
         soundEngine.stop()
         if canvasSize != .zero {
             queryPoint = CGPoint(x: canvasSize.width / 2, y: canvasSize.height / 2)
@@ -564,32 +820,30 @@ struct ContentView: View {
             x: CGFloat.random(in: 0.1 * w...0.9 * w),
             y: CGFloat.random(in: 0.15 * h...0.78 * h)
         )
+        syncIteratesToHull()
         recompute(animated: true)
-    }
-
-    /// The 8 starting iterates: 4 corners and 4 edge midpoints of the canvas.
-    private func borderStartPoints(in size: CGSize) -> [CGPoint] {
-        let minX = borderInset
-        let minY = borderInset
-        let maxX = size.width - borderInset
-        let maxY = size.height - borderInset
-        let midX = size.width / 2
-        let midY = size.height / 2
-        return [
-            CGPoint(x: minX, y: minY), CGPoint(x: midX, y: minY), CGPoint(x: maxX, y: minY),
-            CGPoint(x: maxX, y: midY), CGPoint(x: maxX, y: maxY), CGPoint(x: midX, y: maxY),
-            CGPoint(x: minX, y: maxY), CGPoint(x: minX, y: midY)
-        ]
     }
 
     // MARK: Poster export
 
     private func sharePoster() {
-        guard hasRun, !isAnimating, canvasSize != .zero else { return }
-        let renderer = ImageRenderer(content: posterContent)
-        renderer.scale = 3
-        guard let uiImage = renderer.uiImage else { return }
-        poster = PosterImage(image: Image(uiImage: uiImage))
+        guard hasRun, !isAnimating, canvasSize != .zero, !isRenderingPoster else { return }
+        isRenderingPoster = true
+        Task { @MainActor in
+            // ImageRenderer is main-actor bound, so the rasterization itself
+            // briefly blocks the run loop; sleep one frame first so the
+            // progress indicator is on screen before that happens.
+            try? await Task.sleep(for: .milliseconds(50))
+            defer { isRenderingPoster = false }
+            let renderer = ImageRenderer(content: posterContent)
+            renderer.scale = exportResolution.scale
+            guard let uiImage = renderer.uiImage else { return }
+            poster = PosterImage(
+                image: Image(uiImage: uiImage),
+                pixelSize: CGSize(width: uiImage.size.width * uiImage.scale,
+                                  height: uiImage.size.height * uiImage.scale)
+            )
+        }
     }
 
     /// The finished composition matted and captioned like a gallery print.
@@ -624,6 +878,30 @@ struct ContentView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 10))
                 .shadow(color: .black.opacity(0.25), radius: 14, y: 6)
                 .padding(.horizontal, 24)
+                .opacity(isRenderingPoster ? 0.4 : 1)
+                .overlay {
+                    if isRenderingPoster {
+                        ProgressView("Rendering \(exportResolution.rawValue)…")
+                            .padding(16)
+                            .glassEffect()
+                    }
+                }
+                .animation(.easeInOut(duration: 0.2), value: isRenderingPoster)
+
+            VStack(spacing: 8) {
+                Picker("Resolution", selection: $exportResolution) {
+                    ForEach(ExportResolution.allCases) { resolution in
+                        Text(resolution.rawValue).tag(resolution)
+                    }
+                }
+                .pickerStyle(.segmented)
+                Text("\(Int(poster.pixelSize.width)) × \(Int(poster.pixelSize.height)) px")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .contentTransition(.numericText())
+            }
+            .padding(.horizontal, 24)
+            .disabled(isRenderingPoster)
 
             ShareLink(
                 item: poster.image,
@@ -633,9 +911,14 @@ struct ContentView: View {
                     .frame(minWidth: 160)
             }
             .buttonStyle(.glassProminent)
+            .disabled(isRenderingPoster)
         }
         .padding(.vertical, 28)
         .presentationDetents([.medium, .large])
+        .onChange(of: exportResolution) { _, _ in
+            // Re-render the poster at the newly chosen scale.
+            sharePoster()
+        }
     }
 
     // MARK: Drawing
@@ -650,8 +933,28 @@ struct ContentView: View {
         drawMondrianRegions(in: &context, size: size, upTo: progress)
         drawHull(in: &context)
         drawTrajectories(in: &context, upTo: progress)
+        drawStartPoints(in: &context)
         drawHullPoints(in: &context)
         drawQueryPoint(in: &context)
+    }
+
+    /// Starting iterate markers (squares), visible once a run exists or while
+    /// the user is editing the iterate set.
+    private func drawStartPoints(in context: inout GraphicsContext) {
+        guard hasRun || isEditingIterates else { return }
+        for (index, point) in startPoints.enumerated() {
+            let half: CGFloat = activeDrag == .start(index) ? 8 : 5
+            let square = CGRect(x: point.x - half, y: point.y - half,
+                                width: half * 2, height: half * 2)
+            context.fill(Path(roundedRect: square, cornerRadius: 1), with: .color(palette.line))
+            if isEditingIterates {
+                context.stroke(
+                    Path(roundedRect: square.insetBy(dx: -4, dy: -4), cornerRadius: 2),
+                    with: .color(palette.line.opacity(0.35)),
+                    lineWidth: 2
+                )
+            }
+        }
     }
 
     private func drawHull(in context: inout GraphicsContext) {
@@ -690,11 +993,7 @@ struct ContentView: View {
 
         for trajectory in trajectories {
             let points = trajectory.points
-            guard let first = points.first else { continue }
-
-            // Starting iterate marker (square).
-            let square = CGRect(x: first.x - 5, y: first.y - 5, width: 10, height: 10)
-            context.fill(Path(roundedRect: square, cornerRadius: 1), with: .color(palette.line))
+            guard !points.isEmpty else { continue }
 
             // Angular bars, in the manner of the painter's grid lines.
             let (path, tip) = partialPolyline(points, upTo: progress)
@@ -736,12 +1035,35 @@ struct ContentView: View {
         let n = trajectories.count
         guard hasRun, n >= 2 else { return }
 
-        // Neutral slices first so accents paint over them where trajectories
-        // cross each other. Nonzero winding keeps self-overlapping slices solid.
         func slice(_ i: Int) -> PaletteSlice {
             palette.slices[i % palette.slices.count]
         }
-        let order = trajectories.indices.sorted { slice($0).isNeutral && !slice($1).isNeutral }
+        // Steps traced by the slower of the two trajectories bounding slice i.
+        func sliceSteps(_ i: Int) -> Int {
+            max(trajectories[i].points.count, trajectories[(i + 1) % n].points.count) - 1
+        }
+        let maxSteps = max(1, trajectories.map { $0.points.count - 1 }.max() ?? 1)
+
+        func fillColor(_ i: Int) -> Color {
+            switch coloringMode {
+            case .palette:
+                slice(i).color
+            case .intensity:
+                // More iterations to converge or reach a witness → deeper color.
+                palette.intensityBase.opacity(0.1 + 0.9 * Double(sliceSteps(i)) / Double(maxSteps))
+            }
+        }
+
+        let order: [Int]
+        switch coloringMode {
+        case .palette:
+            // Neutral slices first so accents paint over them where trajectories
+            // cross each other. Nonzero winding keeps self-overlapping slices solid.
+            order = trajectories.indices.sorted { slice($0).isNeutral && !slice($1).isNeutral }
+        case .intensity:
+            // Faint slices first so the deep ones stay visible where they overlap.
+            order = trajectories.indices.sorted { sliceSteps($0) < sliceSteps($1) }
+        }
 
         for i in order {
             let a = revealedPoints(trajectories[i].points, upTo: progress)
@@ -752,7 +1074,7 @@ struct ContentView: View {
             for point in a.dropFirst() { path.addLine(to: point) }
             for point in b.reversed() { path.addLine(to: point) }
             path.closeSubpath()
-            context.fill(path, with: .color(slice(i).color))
+            context.fill(path, with: .color(fillColor(i)))
         }
 
         // Frame on the inset rect the traces start from, like a canvas edge.

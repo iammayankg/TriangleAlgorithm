@@ -23,8 +23,23 @@ struct Palette: Identifiable, Hashable {
     var id: String { name }
 }
 
+/// How the regions between trajectories are colored: the palette's fixed
+/// slice colors, or a single hue whose intensity reflects how many
+/// iterations the bounding trajectories needed to converge or find a witness.
+enum ColoringMode: String, CaseIterable, Identifiable {
+    case palette = "Palette slices"
+    case intensity = "Iteration intensity"
+
+    var id: String { rawValue }
+}
+
 extension Palette {
     static let all: [Palette] = [.mondrian, .kandinsky, .malevich, .bauhaus, .blueprint]
+
+    /// The hue the iteration-intensity coloring mode modulates.
+    var intensityBase: Color {
+        slices.first(where: { !$0.isNeutral })?.color ?? line
+    }
 
     private static func neutral(_ color: Color) -> PaletteSlice {
         PaletteSlice(color: color, isNeutral: true)
