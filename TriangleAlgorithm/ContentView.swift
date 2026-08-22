@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 @main struct TriangleTraceApp: App {
     var body: some Scene {
@@ -10,12 +11,12 @@ import SwiftUI
 
 // MARK: - Geometry helpers
 
-func distance(_ a: CGPoint, _ b: CGPoint) -> CGFloat {
+nonisolated func distance(_ a: CGPoint, _ b: CGPoint) -> CGFloat {
     hypot(a.x - b.x, a.y - b.y)
 }
 
 /// The point on segment [a, b] closest to `target`.
-func closestPointOnSegment(from a: CGPoint, to b: CGPoint, target: CGPoint) -> CGPoint {
+nonisolated func closestPointOnSegment(from a: CGPoint, to b: CGPoint, target: CGPoint) -> CGPoint {
     let dx = b.x - a.x
     let dy = b.y - a.y
     let lengthSquared = dx * dx + dy * dy
@@ -26,7 +27,7 @@ func closestPointOnSegment(from a: CGPoint, to b: CGPoint, target: CGPoint) -> C
 }
 
 /// Convex hull via Andrew's monotone chain, for drawing the hull outline.
-func convexHull(of points: [CGPoint]) -> [CGPoint] {
+nonisolated func convexHull(of points: [CGPoint]) -> [CGPoint] {
     guard points.count >= 3 else { return points }
     let sorted = points.sorted { $0.x == $1.x ? $0.y < $1.y : $0.x < $1.x }
     func cross(_ o: CGPoint, _ a: CGPoint, _ b: CGPoint) -> CGFloat {
@@ -50,7 +51,7 @@ func convexHull(of points: [CGPoint]) -> [CGPoint] {
 }
 
 /// True if `point` lies inside or on the boundary of the convex polygon `hull`.
-func isInsideConvexHull(_ point: CGPoint, hull: [CGPoint]) -> Bool {
+nonisolated func isInsideConvexHull(_ point: CGPoint, hull: [CGPoint]) -> Bool {
     guard hull.count >= 3 else { return false }
     var sign: CGFloat = 0
     for i in hull.indices {
@@ -70,7 +71,7 @@ func isInsideConvexHull(_ point: CGPoint, hull: [CGPoint]) -> Bool {
 
 /// `point` unchanged if it's inside `hull`; otherwise the nearest point on
 /// the hull's boundary.
-func clampToConvexHull(_ point: CGPoint, hull: [CGPoint]) -> CGPoint {
+nonisolated func clampToConvexHull(_ point: CGPoint, hull: [CGPoint]) -> CGPoint {
     guard hull.count >= 3 else { return hull.first ?? point }
     if isInsideConvexHull(point, hull: hull) { return point }
     var best = hull[0]
@@ -100,7 +101,7 @@ enum TriangleAlgorithm {
     /// Traces iterates from `start` toward query point `p` over the vertex set.
     /// Each step pivots on a vertex v with d(x, v) >= d(p, v) and moves to the
     /// point on segment [x, v] nearest to p. Stops with a witness if no pivot exists.
-    static func trace(
+    nonisolated static func trace(
         from start: CGPoint,
         vertices: [CGPoint],
         target p: CGPoint,
@@ -136,6 +137,75 @@ enum TriangleAlgorithm {
             path.append(x)
         }
         return (path, distance(x, p) <= epsilon)
+    }
+
+    /// Like `trace`, but only counts steps — cheap enough to sample many
+    /// starting points, as the iteration-intensity field does.
+    nonisolated static func stepCount(
+        from start: CGPoint,
+        vertices: [CGPoint],
+        target p: CGPoint,
+        epsilon: CGFloat = 1.0,
+        maxIterations: Int = 150
+    ) -> Int {
+        var x = start
+        guard !vertices.isEmpty else { return 0 }
+        for iteration in 0..<maxIterations {
+            let currentGap = distance(x, p)
+            if currentGap <= epsilon { return iteration }
+            var bestNext: CGPoint? = nil
+            var bestGap = CGFloat.greatestFiniteMagnitude
+            for v in vertices where distance(x, v) >= distance(p, v) {
+                let candidate = closestPointOnSegment(from: x, to: v, target: p)
+                let gap = distance(candidate, p)
+                if gap < bestGap {
+                    bestGap = gap
+                    bestNext = candidate
+                }
+            }
+            guard let next = bestNext, bestGap < currentGap else { return iteration }
+            x = next
+        }
+        return maxIterations
+    }
+}
+
+/// A grid of triangle-algorithm step counts sampled across the canvas,
+/// backing the iteration-intensity coloring mode.
+struct IterationField {
+    let cellSize: CGFloat
+    let columns: Int
+    let rows: Int
+    let counts: [Int]
+    let maxCount: Int
+
+    /// Renders the sampled counts into a bitmap with one pixel per cell.
+    /// Drawing it scaled up with interpolation smooths the gradient far
+    /// beyond the sampling resolution. Unsampled cells stay transparent.
+    func makeImage(baseColor: UIColor) -> CGImage? {
+        var red: CGFloat = 0, green: CGFloat = 0, blue: CGFloat = 0, baseAlpha: CGFloat = 0
+        baseColor.getRed(&red, green: &green, blue: &blue, alpha: &baseAlpha)
+        var pixels = [UInt8](repeating: 0, count: columns * rows * 4)
+        for index in counts.indices {
+            let steps = counts[index]
+            guard steps >= 0 else { continue }
+            let alpha = (0.05 + 0.95 * Double(steps) / Double(maxCount)) * baseAlpha
+            func component(_ value: CGFloat) -> UInt8 {
+                UInt8(max(0, min(255, value * alpha * 255)))
+            }
+            let offset = index * 4
+            pixels[offset] = component(red)
+            pixels[offset + 1] = component(green)
+            pixels[offset + 2] = component(blue)
+            pixels[offset + 3] = UInt8(max(0, min(255, alpha * 255)))
+        }
+        return pixels.withUnsafeMutableBytes { buffer in
+            CGContext(data: buffer.baseAddress, width: columns, height: rows,
+                      bitsPerComponent: 8, bytesPerRow: columns * 4,
+                      space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)?
+                .makeImage()
+        }
     }
 }
 
@@ -190,6 +260,11 @@ struct ContentView: View {
     @State private var showInfo = false
     @State private var palette: Palette = .mondrian
     @State private var coloringMode: ColoringMode = .palette
+    @State private var iterationField: IterationField? = nil
+    @State private var fieldImage: CGImage? = nil
+    @State private var fieldTask: Task<Void, Never>? = nil
+    @State private var isBuildingField = false
+    @State private var fieldProgress: Double = 0
     @State private var iterateScheme: IterateScheme = .border
     @State private var startPoints: [CGPoint] = []
     @State private var isEditingIterates = false
@@ -271,6 +346,15 @@ struct ContentView: View {
         .onChange(of: soundOn) { _, isOn in
             if !isOn { soundEngine.stop() }
         }
+        .onChange(of: coloringMode) { _, _ in
+            rebuildIterationField()
+        }
+        .onChange(of: palette) { _, newPalette in
+            // The field's data survives a theme change; only re-tint the bitmap.
+            if let field = iterationField {
+                fieldImage = field.makeImage(baseColor: UIColor(newPalette.intensityBase))
+            }
+        }
         .onChange(of: iterateScheme) { _, newScheme in
             guard let points = newScheme.points(inHull: convexHull(of: hullPoints)) else { return }
             startPoints = points
@@ -329,6 +413,10 @@ struct ContentView: View {
             // The chip gets its own row so its text never fights the
             // buttons for width on small screens.
             statusChip
+            if isBuildingField {
+                fieldProgressChip
+                    .transition(.opacity)
+            }
             if hasRun && !isAnimating {
                 legend
                     .transition(.opacity.combined(with: .move(edge: .top)))
@@ -336,6 +424,26 @@ struct ContentView: View {
         }
         .animation(.spring(duration: 0.4), value: isAnimating)
         .animation(.spring(duration: 0.4), value: hasRun)
+        .animation(.spring(duration: 0.3), value: isBuildingField)
+    }
+
+    private var fieldProgressChip: some View {
+        HStack(spacing: 10) {
+            ProgressView(value: fieldProgress)
+                .frame(width: 90)
+            Text("Intensity \(Int(fieldProgress * 100))%")
+                .monospacedDigit()
+            Button("Stop") {
+                cancelFieldBuild()
+            }
+            .font(.caption.bold())
+        }
+        .font(.caption)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .glassEffect()
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Computing intensity plot, \(Int(fieldProgress * 100)) percent. Stop.")
     }
 
     @ViewBuilder
@@ -372,11 +480,17 @@ struct ContentView: View {
             .padding(.vertical, 10)
             .glassEffect(.regular.tint(inside ? Color.green.opacity(0.45) : Color.red.opacity(0.45)))
         } else if isAnimating {
-            Label("Tracing \(trajectories.count) trajectories…", systemImage: "point.bottomleft.forward.to.point.topright.scurvepath")
-                .font(.subheadline)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-                .glassEffect()
+            HStack(spacing: 12) {
+                Label("Tracing \(trajectories.count) trajectories…", systemImage: "point.bottomleft.forward.to.point.topright.scurvepath")
+                Button("Stop") {
+                    stopTrace()
+                }
+                .font(.subheadline.bold())
+            }
+            .font(.subheadline)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .glassEffect()
         } else if !hullPoints.isEmpty {
             Text(hullPoints.count < 3
                  ? "\(hullPoints.count) point\(hullPoints.count == 1 ? "" : "s") — add at least 3"
@@ -478,38 +592,63 @@ struct ContentView: View {
     }
 
     private var infoContent: some View {
+        ScrollView {
+            infoText
+        }
+        .frame(idealWidth: 340, maxHeight: 460)
+    }
+
+    private var infoText: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Kalantari's Triangle Algorithm")
                 .font(.headline)
             Text("Iterates start from a configurable set of points inside the convex hull — its vertices and edge midpoints by default. Each step finds a pivot vertex v with d(x, v) ≥ d(p, v) and jumps to the point on the segment [x, v] closest to the target p.")
             Text("If an iterate gets within ε of the target, the point is in the hull. If no pivot exists, the iterate is a witness — proof the point is outside.")
             Divider()
+            Text("Intensity plot")
+                .font(.headline)
+            Text("The Iteration intensity coloring ignores the visible iterates and instead samples a fine grid of thousands of points across the hull's interior, running the algorithm from every one. The more steps a point needs to converge or reach a witness, the deeper it is painted in the theme's accent color.")
+            Text("The plot is computed in batches in the background and sweeps in as it builds — you can stop it at any time and keep the partial result. It recomputes coarsely while you drag, then refines when you let go.")
+            Divider()
             legendRows
         }
         .font(.callout)
         .padding()
-        .frame(idealWidth: 320)
     }
 
+    /// Compact key under the status chip, matched to the coloring mode:
+    /// trajectory markers in palette mode, the step-count gradient in
+    /// intensity mode.
     private var legend: some View {
         HStack(spacing: 14) {
-            HStack(spacing: 5) {
-                RoundedRectangle(cornerRadius: 1)
-                    .fill(palette.line)
-                    .frame(width: 9, height: 9)
-                Text("Start")
+            if coloringMode == .intensity {
+                HStack(spacing: 5) {
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(LinearGradient(
+                            colors: [palette.intensityBase.opacity(0.08), palette.intensityBase],
+                            startPoint: .leading, endPoint: .trailing))
+                        .frame(width: 46, height: 9)
+                    Text("Fewer → more steps")
+                }
+            } else {
+                HStack(spacing: 5) {
+                    RoundedRectangle(cornerRadius: 1)
+                        .fill(palette.line)
+                        .frame(width: 9, height: 9)
+                    Text("Start")
+                }
+                HStack(spacing: 5) {
+                    Image(systemName: "xmark")
+                        .font(.caption.bold())
+                        .foregroundStyle(palette.line)
+                    Text("Witness")
+                }
             }
             HStack(spacing: 5) {
                 Circle()
                     .strokeBorder(palette.target, lineWidth: 2)
                     .frame(width: 11, height: 11)
                 Text("Target")
-            }
-            HStack(spacing: 5) {
-                Image(systemName: "xmark")
-                    .font(.caption.bold())
-                    .foregroundStyle(palette.line)
-                Text("Witness")
             }
         }
         .font(.caption)
@@ -529,6 +668,8 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
             Label("✕ — witness: the point is outside", systemImage: "xmark")
                 .foregroundStyle(palette.line)
+            Label("Gradient — deeper color, more iterations (intensity mode)", systemImage: "circle.lefthalf.filled")
+                .foregroundStyle(palette.intensityBase)
         }
         .font(.footnote)
     }
@@ -663,8 +804,13 @@ struct ContentView: View {
                 if hasRun { recompute(animated: false) }
             }
             .onEnded { _ in
+                let wasDragging = activeDrag != nil
                 activeDrag = nil
                 dragResolved = false
+                // Refine the coarse drag-time field back to full resolution.
+                if wasDragging && hasRun && coloringMode == .intensity {
+                    rebuildIterationField()
+                }
             }
     }
 
@@ -718,6 +864,82 @@ struct ContentView: View {
         }
     }
 
+    /// Samples the hull's interior on a fine grid and records how many steps
+    /// the algorithm needs from each cell, so the intensity mode paints a
+    /// smooth gradient independent of the visible iterate set. Cells outside
+    /// the hull are marked unsampled and stay unpainted — like the iterates
+    /// themselves, the field only starts from inside the hull.
+    ///
+    /// The sampling runs in a cancellable background task, publishing a
+    /// partial field after each batch of rows so the gradient sweeps in
+    /// progressively and the user can stop a long build partway.
+    ///
+    /// While the user is dragging, `coarse` builds a quick low-resolution
+    /// field for live feedback (no progress chip); the fine grid is rebuilt
+    /// when the drag ends.
+    private func rebuildIterationField(coarse: Bool = false) {
+        fieldTask?.cancel()
+        let hull = convexHull(of: hullPoints)
+        guard coloringMode == .intensity, hasRun,
+              let p = queryPoint, hull.count >= 3, canvasSize != .zero else {
+            iterationField = nil
+            fieldImage = nil
+            isBuildingField = false
+            return
+        }
+        let cellSize: CGFloat = coarse ? 12 : 3
+        let columns = Int(ceil(canvasSize.width / cellSize))
+        let rows = Int(ceil(canvasSize.height / cellSize))
+        guard columns > 0, rows > 0 else {
+            iterationField = nil
+            fieldImage = nil
+            isBuildingField = false
+            return
+        }
+        let vertices = hullPoints
+        isBuildingField = !coarse
+        fieldProgress = 0
+        fieldTask = Task.detached(priority: .userInitiated) {
+            var counts = [Int](repeating: -1, count: columns * rows)
+            var maxCount = 1
+            let batchRows = 6
+            for batchStart in stride(from: 0, to: rows, by: batchRows) {
+                let batchEnd = min(batchStart + batchRows, rows)
+                for row in batchStart..<batchEnd {
+                    if Task.isCancelled { return }
+                    for column in 0..<columns {
+                        let start = CGPoint(x: (CGFloat(column) + 0.5) * cellSize,
+                                            y: (CGFloat(row) + 0.5) * cellSize)
+                        guard isInsideConvexHull(start, hull: hull) else { continue }
+                        let steps = TriangleAlgorithm.stepCount(from: start, vertices: vertices, target: p)
+                        counts[row * columns + column] = steps
+                        maxCount = max(maxCount, steps)
+                    }
+                }
+                if Task.isCancelled { return }
+                let partial = IterationField(cellSize: cellSize, columns: columns,
+                                             rows: rows, counts: counts, maxCount: maxCount)
+                let progress = Double(batchEnd) / Double(rows)
+                await MainActor.run {
+                    iterationField = partial
+                    fieldImage = partial.makeImage(baseColor: UIColor(palette.intensityBase))
+                    if !coarse {
+                        fieldProgress = progress
+                        if batchEnd == rows { isBuildingField = false }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Stops an in-flight intensity-field build, keeping whatever batches
+    /// have already been painted.
+    private func cancelFieldBuild() {
+        fieldTask?.cancel()
+        fieldTask = nil
+        isBuildingField = false
+    }
+
     private func recompute(animated: Bool) {
         guard let p = queryPoint, !hullPoints.isEmpty, canvasSize != .zero else { return }
         // A random scheme samples a fresh set on every animated run, so each
@@ -732,6 +954,7 @@ struct ContentView: View {
             let result = TriangleAlgorithm.trace(from: start, vertices: hullPoints, target: p)
             return Trajectory(points: result.points, converged: result.converged)
         }
+        rebuildIterationField(coarse: activeDrag != nil)
         if animated {
             runStart = Date()
             isAnimating = true
@@ -754,6 +977,13 @@ struct ContentView: View {
             return SoundEngine.Voice(gaps: gaps, converged: trajectory.converged)
         }
         soundEngine.play(voices: voices, stepsPerSecond: stepsPerSecond)
+    }
+
+    /// Ends the trace playback early: the fully traced composition and the
+    /// membership verdict appear immediately instead of step by step.
+    private func stopTrace() {
+        withAnimation(.spring(duration: 0.4)) { isAnimating = false }
+        soundEngine.stop()
     }
 
     private func undo() {
@@ -800,6 +1030,9 @@ struct ContentView: View {
         isAnimating = false
         isEditingIterates = false
         syncIteratesToHull()
+        cancelFieldBuild()
+        iterationField = nil
+        fieldImage = nil
         soundEngine.stop()
         if canvasSize != .zero {
             queryPoint = CGPoint(x: canvasSize.width / 2, y: canvasSize.height / 2)
@@ -930,9 +1163,18 @@ struct ContentView: View {
         } else {
             progress = .infinity
         }
-        drawMondrianRegions(in: &context, size: size, upTo: progress)
+        switch coloringMode {
+        case .palette:
+            drawMondrianRegions(in: &context, size: size, upTo: progress)
+        case .intensity:
+            drawIterationField(in: &context, size: size)
+        }
         drawHull(in: &context)
-        drawTrajectories(in: &context, upTo: progress)
+        // The intensity field speaks for itself; trajectory polylines would
+        // just cover it, so they only render in palette mode.
+        if coloringMode == .palette {
+            drawTrajectories(in: &context, upTo: progress)
+        }
         drawStartPoints(in: &context)
         drawHullPoints(in: &context)
         drawQueryPoint(in: &context)
@@ -941,7 +1183,9 @@ struct ContentView: View {
     /// Starting iterate markers (squares), visible once a run exists or while
     /// the user is editing the iterate set.
     private func drawStartPoints(in context: inout GraphicsContext) {
-        guard hasRun || isEditingIterates else { return }
+        // In intensity mode the squares belong to the hidden trajectories,
+        // so they only appear while the user is editing the iterate set.
+        guard isEditingIterates || (hasRun && coloringMode == .palette) else { return }
         for (index, point) in startPoints.enumerated() {
             let half: CGFloat = activeDrag == .start(index) ? 8 : 5
             let square = CGRect(x: point.x - half, y: point.y - half,
@@ -1035,35 +1279,12 @@ struct ContentView: View {
         let n = trajectories.count
         guard hasRun, n >= 2 else { return }
 
+        // Neutral slices first so accents paint over them where trajectories
+        // cross each other. Nonzero winding keeps self-overlapping slices solid.
         func slice(_ i: Int) -> PaletteSlice {
             palette.slices[i % palette.slices.count]
         }
-        // Steps traced by the slower of the two trajectories bounding slice i.
-        func sliceSteps(_ i: Int) -> Int {
-            max(trajectories[i].points.count, trajectories[(i + 1) % n].points.count) - 1
-        }
-        let maxSteps = max(1, trajectories.map { $0.points.count - 1 }.max() ?? 1)
-
-        func fillColor(_ i: Int) -> Color {
-            switch coloringMode {
-            case .palette:
-                slice(i).color
-            case .intensity:
-                // More iterations to converge or reach a witness → deeper color.
-                palette.intensityBase.opacity(0.1 + 0.9 * Double(sliceSteps(i)) / Double(maxSteps))
-            }
-        }
-
-        let order: [Int]
-        switch coloringMode {
-        case .palette:
-            // Neutral slices first so accents paint over them where trajectories
-            // cross each other. Nonzero winding keeps self-overlapping slices solid.
-            order = trajectories.indices.sorted { slice($0).isNeutral && !slice($1).isNeutral }
-        case .intensity:
-            // Faint slices first so the deep ones stay visible where they overlap.
-            order = trajectories.indices.sorted { sliceSteps($0) < sliceSteps($1) }
-        }
+        let order = trajectories.indices.sorted { slice($0).isNeutral && !slice($1).isNeutral }
 
         for i in order {
             let a = revealedPoints(trajectories[i].points, upTo: progress)
@@ -1074,10 +1295,28 @@ struct ContentView: View {
             for point in a.dropFirst() { path.addLine(to: point) }
             for point in b.reversed() { path.addLine(to: point) }
             path.closeSubpath()
-            context.fill(path, with: .color(fillColor(i)))
+            context.fill(path, with: .color(slice(i).color))
         }
 
         // Frame on the inset rect the traces start from, like a canvas edge.
+        let frame = CGRect(x: borderInset, y: borderInset,
+                           width: size.width - 2 * borderInset,
+                           height: size.height - 2 * borderInset)
+        context.stroke(Path(frame), with: .color(palette.line), lineWidth: 3)
+    }
+
+    /// Paints the iteration-count field sampled across the whole canvas:
+    /// each cell's color deepens with the number of steps the algorithm
+    /// needs from that point, regardless of the visible iterate set.
+    private func drawIterationField(in context: inout GraphicsContext, size: CGSize) {
+        guard hasRun, let field = iterationField, let bitmap = fieldImage else { return }
+        // One pixel per sampled cell, stretched over the canvas with
+        // interpolation — much smoother and cheaper than per-cell rects.
+        let rect = CGRect(x: 0, y: 0,
+                          width: CGFloat(field.columns) * field.cellSize,
+                          height: CGFloat(field.rows) * field.cellSize)
+        let image = Image(decorative: bitmap, scale: 1).interpolation(.medium)
+        context.draw(image, in: rect)
         let frame = CGRect(x: borderInset, y: borderInset,
                            width: size.width - 2 * borderInset,
                            height: size.height - 2 * borderInset)
