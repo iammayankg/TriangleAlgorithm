@@ -258,6 +258,8 @@ struct ContentView: View {
     @State private var activeDrag: DragTarget? = nil
     @State private var dragResolved = false
     @State private var showInfo = false
+    @State private var showHelp = false
+    @AppStorage("hasSeenHelpOverlay") private var hasSeenHelpOverlay = false
     @State private var palette: Palette = .mondrian
     @State private var coloringMode: ColoringMode = .palette
     @State private var iterationField: IterationField? = nil
@@ -310,7 +312,20 @@ struct ContentView: View {
                 .padding()
                 .transition(.opacity)
             }
+
+            if showHelp {
+                HelpOverlay {
+                    hasSeenHelpOverlay = true
+                    showHelp = false
+                }
+                .transition(.opacity)
+                .zIndex(1)
+            }
         }
+        .onAppear {
+            if !hasSeenHelpOverlay { showHelp = true }
+        }
+        .animation(.easeInOut(duration: 0.25), value: showHelp)
         .animation(.easeInOut(duration: 0.3), value: isAmbient)
         .sensoryFeedback(trigger: isAnimating) { oldValue, newValue in
             guard oldValue && !newValue, let inside = membershipResult else { return nil }
@@ -346,7 +361,14 @@ struct ContentView: View {
         .onChange(of: soundOn) { _, isOn in
             if !isOn { soundEngine.stop() }
         }
-        .onChange(of: coloringMode) { _, _ in
+        .onChange(of: coloringMode) { _, newMode in
+            if newMode == .intensity {
+                // The plot doesn't use the iterate set; leave editing mode.
+                isEditingIterates = false
+                // A cleared custom set would leave Run disabled with the
+                // iterate controls hidden — fall back to the default scheme.
+                if startPoints.isEmpty { iterateScheme = .border }
+            }
             rebuildIterationField()
         }
         .onChange(of: palette) { _, newPalette in
@@ -405,7 +427,11 @@ struct ContentView: View {
         VStack(spacing: 10) {
             HStack(alignment: .top, spacing: 10) {
                 themeMenu
-                iterateMenu
+                // The intensity plot ignores the iterate set, so editing
+                // controls only appear in palette mode.
+                if coloringMode == .palette {
+                    iterateMenu
+                }
                 Spacer()
                 shareButton
                 infoButton
@@ -425,6 +451,7 @@ struct ContentView: View {
         .animation(.spring(duration: 0.4), value: isAnimating)
         .animation(.spring(duration: 0.4), value: hasRun)
         .animation(.spring(duration: 0.3), value: isBuildingField)
+        .animation(.spring(duration: 0.3), value: coloringMode)
     }
 
     private var fieldProgressChip: some View {
@@ -611,6 +638,13 @@ struct ContentView: View {
             Text("The plot is computed in batches in the background and sweeps in as it builds — you can stop it at any time and keep the partial result. It recomputes coarsely while you drag, then refines when you let go.")
             Divider()
             legendRows
+            Divider()
+            Button {
+                showInfo = false
+                showHelp = true
+            } label: {
+                Label("Show quick guide", systemImage: "questionmark.circle")
+            }
         }
         .font(.callout)
         .padding()

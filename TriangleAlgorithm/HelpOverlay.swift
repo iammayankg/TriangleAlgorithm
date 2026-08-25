@@ -26,7 +26,13 @@ struct HelpOverlay: View {
                         row(icon: "play.fill", title: "Run",
                             detail: "Trajectories trace toward the target with sound. Converging paths mean the point is inside; a ✕ marks a witness proving it's outside. Stop skips to the result.")
                         row(icon: "paintpalette", title: "Style it",
-                            detail: "Pick an art theme, then choose the coloring: painted slices between trajectories, or a gradient showing how many steps each point of the hull needs.")
+                            detail: "The palette menu holds five art themes — each sets the canvas, line, and accent colors, and restyles the finished picture instantly, no re-run needed.")
+
+                        paletteGallery
+                            .padding(.leading, 46)
+
+                        row(icon: "square.stack.3d.up", title: "How the paint is applied",
+                            detail: "In Palette slices mode, the regions between neighboring trajectories are filled with the theme's colors — neutral tones first, accents layered on top where paths cross. In Iteration intensity mode, the hull becomes a gradient: the algorithm runs from thousands of interior points, and the theme's accent color deepens where more steps are needed.")
                         row(icon: "square.grid.3x3.topleft.filled", title: "Shape the iterates",
                             detail: "In slice mode, choose how the starting iterates are laid out — border, ring, spiral, random — or edit them by hand. They always live inside the hull.")
                         row(icon: "sparkles", title: "And more",
@@ -46,6 +52,38 @@ struct HelpOverlay: View {
             .glassEffect(in: .rect(cornerRadius: 28))
             .padding(24)
         }
+    }
+
+    /// One swatch strip per theme: canvas, line, then the accent colors.
+    private var paletteGallery: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(Palette.all) { palette in
+                HStack(spacing: 10) {
+                    HStack(spacing: 3) {
+                        swatch(palette.background)
+                        swatch(palette.line)
+                        ForEach(Array(accentColors(of: palette).enumerated()), id: \.offset) { _, color in
+                            swatch(color)
+                        }
+                    }
+                    Text(palette.name)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func accentColors(of palette: Palette) -> [Color] {
+        var seen: Set<Color> = []
+        return palette.slices.filter { !$0.isNeutral && seen.insert($0.color).inserted }.map(\.color)
+    }
+
+    private func swatch(_ color: Color) -> some View {
+        RoundedRectangle(cornerRadius: 3)
+            .fill(color)
+            .frame(width: 15, height: 15)
+            .overlay(RoundedRectangle(cornerRadius: 3).strokeBorder(.secondary.opacity(0.35), lineWidth: 0.5))
     }
 
     private func row(icon: String, title: String, detail: String) -> some View {
