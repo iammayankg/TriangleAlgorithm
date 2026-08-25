@@ -21,8 +21,8 @@ struct HelpOverlay: View {
 
                         row(icon: "hand.tap", title: "Build a hull",
                             detail: "Tap the canvas to drop points — you need at least three. Drag any dot to reshape the hull; the buttons below undo or clear.")
-                        row(icon: "circlebadge", title: "Place the target",
-                            detail: "Drag the ring anywhere on the canvas. The app tests whether that point lies inside the hull.")
+                        row(icon: "circlebadge.fill", title: "Place the target",
+                            detail: "Drag the dot anywhere on the canvas. The app tests whether that point lies inside the hull.")
                         row(icon: "play.fill", title: "Run",
                             detail: "Trajectories trace toward the target with sound. Converging paths mean the point is inside; a ✕ marks a witness proving it's outside. Stop skips to the result.")
                         row(icon: "paintpalette", title: "Style it",

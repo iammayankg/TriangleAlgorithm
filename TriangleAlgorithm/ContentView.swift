@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import Photos
 
 @main struct TriangleTraceApp: App {
     var body: some Scene {
@@ -224,6 +225,7 @@ struct ContentView: View {
     struct PosterImage: Identifiable {
         var id: String { "poster" }
         let image: Image
+        let uiImage: UIImage
         let pixelSize: CGSize
     }
 
@@ -274,10 +276,14 @@ struct ContentView: View {
     @State private var showOutsideHullWarning = false
     @State private var outsideHullWarningNonce = 0
     @State private var soundOn = true
+    @State private var showBisector = false
     @State private var isAmbient = false
     @State private var poster: PosterImage? = nil
     @State private var exportResolution: ExportResolution = .high
     @State private var isRenderingPoster = false
+    @State private var isSavingToPhotos = false
+    @State private var didSaveToPhotos = false
+    @State private var showSaveFailedAlert = false
     @State private var soundEngine = SoundEngine()
 
     private let stepsPerSecond: Double = 7
@@ -400,7 +406,7 @@ struct ContentView: View {
                 .font(.system(size: 44))
             Text("Tap anywhere to add hull points")
                 .font(.headline)
-            Text("Drag the target ring to move it, then press Run")
+            Text("Drag the target dot to move it, then press Run")
                 .font(.subheadline)
         }
         .foregroundStyle(.secondary)
@@ -433,6 +439,7 @@ struct ContentView: View {
                     iterateMenu
                 }
                 Spacer()
+                resultDot
                 shareButton
                 infoButton
             }
@@ -442,10 +449,6 @@ struct ContentView: View {
             if isBuildingField {
                 fieldProgressChip
                     .transition(.opacity)
-            }
-            if hasRun && !isAnimating {
-                legend
-                    .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
         .animation(.spring(duration: 0.4), value: isAnimating)
@@ -473,6 +476,21 @@ struct ContentView: View {
         .accessibilityLabel("Computing intensity plot, \(Int(fieldProgress * 100)) percent. Stop.")
     }
 
+    /// Membership verdict as a single dot beside the menu buttons:
+    /// green for inside the hull, red for a witness (outside).
+    @ViewBuilder
+    private var resultDot: some View {
+        if let inside = membershipResult, !isAnimating {
+            Circle()
+                .fill(inside ? Color.green : Color.red)
+                .frame(width: 12, height: 12)
+                .padding(10)
+                .glassEffect()
+                .transition(.opacity)
+                .accessibilityLabel(inside ? "Inside the convex hull" : "Outside — witness found")
+        }
+    }
+
     @ViewBuilder
     private var statusChip: some View {
         if isEditingIterates && !isAnimating {
@@ -497,15 +515,6 @@ struct ContentView: View {
             .glassEffect(showOutsideHullWarning
                          ? .regular.tint(Color.orange.opacity(0.45))
                          : .regular)
-        } else if let inside = membershipResult, !isAnimating {
-            Label(
-                inside ? "Inside the convex hull" : "Outside — witness found",
-                systemImage: inside ? "checkmark.seal.fill" : "xmark.seal.fill"
-            )
-            .font(.headline)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
-            .glassEffect(.regular.tint(inside ? Color.green.opacity(0.45) : Color.red.opacity(0.45)))
         } else if isAnimating {
             HStack(spacing: 12) {
                 Label("Tracing \(trajectories.count) trajectories…", systemImage: "point.bottomleft.forward.to.point.topright.scurvepath")
@@ -650,53 +659,11 @@ struct ContentView: View {
         .padding()
     }
 
-    /// Compact key under the status chip, matched to the coloring mode:
-    /// trajectory markers in palette mode, the step-count gradient in
-    /// intensity mode.
-    private var legend: some View {
-        HStack(spacing: 14) {
-            if coloringMode == .intensity {
-                HStack(spacing: 5) {
-                    RoundedRectangle(cornerRadius: 2)
-                        .fill(LinearGradient(
-                            colors: [palette.intensityBase.opacity(0.08), palette.intensityBase],
-                            startPoint: .leading, endPoint: .trailing))
-                        .frame(width: 46, height: 9)
-                    Text("Fewer → more steps")
-                }
-            } else {
-                HStack(spacing: 5) {
-                    RoundedRectangle(cornerRadius: 1)
-                        .fill(palette.line)
-                        .frame(width: 9, height: 9)
-                    Text("Start")
-                }
-                HStack(spacing: 5) {
-                    Image(systemName: "xmark")
-                        .font(.caption.bold())
-                        .foregroundStyle(palette.line)
-                    Text("Witness")
-                }
-            }
-            HStack(spacing: 5) {
-                Circle()
-                    .strokeBorder(palette.target, lineWidth: 2)
-                    .frame(width: 11, height: 11)
-                Text("Target")
-            }
-        }
-        .font(.caption)
-        .foregroundStyle(.secondary)
-        .padding(.horizontal, 14)
-        .padding(.vertical, 7)
-        .glassEffect()
-    }
-
     private var legendRows: some View {
         VStack(alignment: .leading, spacing: 6) {
             Label("Dots — hull vertices (tap to add, drag to move)", systemImage: "circle.fill")
                 .foregroundStyle(palette.vertex)
-            Label("Ring — target point (drag to move)", systemImage: "circlebadge")
+            Label("Dot — target point (drag to move)", systemImage: "circlebadge.fill")
                 .foregroundStyle(palette.target)
             Label("Squares — the starting iterates (pick a scheme or edit them)", systemImage: "square.fill")
                 .foregroundStyle(.secondary)
@@ -751,6 +718,9 @@ struct ContentView: View {
             }
             Toggle(isOn: $soundOn) {
                 Label("Sound", systemImage: soundOn ? "speaker.wave.2" : "speaker.slash")
+            }
+            Toggle(isOn: $showBisector) {
+                Label("Witness bisector", systemImage: "line.diagonal")
             }
             Divider()
             Button(role: .destructive, action: clearAll) {
@@ -1105,8 +1075,10 @@ struct ContentView: View {
             let renderer = ImageRenderer(content: posterContent)
             renderer.scale = exportResolution.scale
             guard let uiImage = renderer.uiImage else { return }
+            didSaveToPhotos = false
             poster = PosterImage(
                 image: Image(uiImage: uiImage),
+                uiImage: uiImage,
                 pixelSize: CGSize(width: uiImage.size.width * uiImage.scale,
                                   height: uiImage.size.height * uiImage.scale)
             )
@@ -1179,12 +1151,55 @@ struct ContentView: View {
             }
             .buttonStyle(.glassProminent)
             .disabled(isRenderingPoster)
+
+            Button {
+                saveToPhotos(poster)
+            } label: {
+                if isSavingToPhotos {
+                    ProgressView()
+                        .frame(minWidth: 160)
+                } else {
+                    Label(didSaveToPhotos ? "Saved" : "Save to Photos",
+                          systemImage: didSaveToPhotos ? "checkmark" : "square.and.arrow.down")
+                        .frame(minWidth: 160)
+                }
+            }
+            .buttonStyle(.glass)
+            .disabled(isRenderingPoster || isSavingToPhotos || didSaveToPhotos)
         }
         .padding(.vertical, 28)
         .presentationDetents([.medium, .large])
         .onChange(of: exportResolution) { _, _ in
             // Re-render the poster at the newly chosen scale.
             sharePoster()
+        }
+        .alert("Couldn't save to Photos", isPresented: $showSaveFailedAlert) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text("Allow photo library access for TriangleTrace in Settings and try again.")
+        }
+    }
+
+    /// Writes the rendered poster straight to the photo library, requesting
+    /// add-only access the first time.
+    private func saveToPhotos(_ poster: PosterImage) {
+        guard !isSavingToPhotos else { return }
+        isSavingToPhotos = true
+        Task {
+            defer { isSavingToPhotos = false }
+            let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
+            guard status == .authorized || status == .limited else {
+                showSaveFailedAlert = true
+                return
+            }
+            do {
+                try await PHPhotoLibrary.shared().performChanges {
+                    PHAssetChangeRequest.creationRequestForAsset(from: poster.uiImage)
+                }
+                withAnimation(.easeInOut(duration: 0.2)) { didSaveToPhotos = true }
+            } catch {
+                showSaveFailedAlert = true
+            }
         }
     }
 
@@ -1257,13 +1272,11 @@ struct ContentView: View {
 
     private func drawQueryPoint(in context: inout GraphicsContext) {
         guard let p = queryPoint else { return }
-        let radius: CGFloat = activeDrag == .query ? 13 : 10
-        let outer = CGRect(x: p.x - radius, y: p.y - radius,
-                           width: radius * 2, height: radius * 2)
-        context.fill(Path(ellipseIn: outer), with: .color(palette.background.opacity(0.85)))
-        context.stroke(Path(ellipseIn: outer), with: .color(palette.target), lineWidth: 3)
-        let inner = CGRect(x: p.x - 3.5, y: p.y - 3.5, width: 7, height: 7)
-        context.fill(Path(ellipseIn: inner), with: .color(palette.target))
+        let radius: CGFloat = activeDrag == .query ? 8 : 5
+        let rect = CGRect(x: p.x - radius, y: p.y - radius,
+                          width: radius * 2, height: radius * 2)
+        context.fill(Path(ellipseIn: rect), with: .color(palette.target))
+        context.stroke(Path(ellipseIn: rect), with: .color(palette.background), lineWidth: 2)
     }
 
     private func drawTrajectories(in context: inout GraphicsContext, upTo progress: Double) {
@@ -1293,6 +1306,9 @@ struct ContentView: View {
 
             // Witness marker: an ✕ at the final iterate of a non-converged trajectory.
             if fullyRevealed && !trajectory.converged, let last = points.last {
+                if showBisector, let p = queryPoint {
+                    drawBisector(between: last, and: p, in: &context)
+                }
                 var cross = Path()
                 cross.move(to: CGPoint(x: last.x - 6, y: last.y - 6))
                 cross.addLine(to: CGPoint(x: last.x + 6, y: last.y + 6))
@@ -1301,6 +1317,27 @@ struct ContentView: View {
                 context.stroke(cross, with: .color(palette.line), lineWidth: 3)
             }
         }
+    }
+
+    /// The orthogonal bisector of the segment from a witness to the target:
+    /// every hull vertex lies on the witness's side, so the dashed line
+    /// visibly separates the target from the hull.
+    private func drawBisector(between witness: CGPoint, and p: CGPoint, in context: inout GraphicsContext) {
+        let dx = p.x - witness.x
+        let dy = p.y - witness.y
+        let gap = hypot(dx, dy)
+        guard gap > 0 else { return }
+        let mid = CGPoint(x: (witness.x + p.x) / 2, y: (witness.y + p.y) / 2)
+        // Unit direction along the bisector, perpendicular to witness → target.
+        let ux = -dy / gap
+        let uy = dx / gap
+        // Long enough to cross the whole canvas from any midpoint.
+        let reach = canvasSize.width + canvasSize.height
+        var line = Path()
+        line.move(to: CGPoint(x: mid.x - ux * reach, y: mid.y - uy * reach))
+        line.addLine(to: CGPoint(x: mid.x + ux * reach, y: mid.y + uy * reach))
+        context.stroke(line, with: .color(palette.target),
+                       style: StrokeStyle(lineWidth: 2, dash: [7, 5]))
     }
 
     /// Fills the regions between consecutive trajectories with the palette's
