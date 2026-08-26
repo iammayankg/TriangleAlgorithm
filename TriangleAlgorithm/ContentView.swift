@@ -1344,7 +1344,6 @@ struct ContentView: View {
             }
             .frame(width: canvasSize.width, height: canvasSize.height)
             .background(palette.background)
-            .border(palette.line, width: 3)
 
             HStack(alignment: .firstTextBaseline) {
                 Text("TriangleTrace")
