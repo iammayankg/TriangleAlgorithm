@@ -26,7 +26,7 @@ struct HelpOverlay: View {
                         row(icon: "play.fill", title: "Run",
                             detail: "Trajectories trace toward the target with sound. Converging paths mean the point is inside; a ✕ marks a witness proving it's outside. Stop skips to the result.")
                         row(icon: "paintpalette", title: "Style it",
-                            detail: "The palette menu holds five art themes — each sets the canvas, line, and accent colors, and restyles the finished picture instantly, no re-run needed.")
+                            detail: "Settings (under ⋯) holds the art themes and a customizable palette — each sets the line and accent colors, and restyles the finished picture instantly, no re-run needed.")
 
                         paletteGallery
                             .padding(.leading, 46)
@@ -36,7 +36,7 @@ struct HelpOverlay: View {
                         row(icon: "square.grid.3x3.topleft.filled", title: "Shape the iterates",
                             detail: "In slice mode, choose how the starting iterates are laid out — border, ring, spiral, random — or edit them by hand. They always live inside the hull.")
                         row(icon: "sparkles", title: "And more",
-                            detail: "The dice paints a random example, ambient mode composes endlessly until you tap, and the share button exports your run as a poster.")
+                            detail: "The shapes menu drops a square, circle, ellipse, or random example onto the canvas; ambient mode composes endlessly until you tap, and the share button exports your run as a poster.")
                     }
                     .padding(24)
                 }

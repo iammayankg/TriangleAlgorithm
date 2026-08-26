@@ -219,6 +219,24 @@ struct ContentView: View {
         case start(Int)
     }
 
+    /// Preset outlines the vertex set S can be sampled from: random points
+    /// scattered along the shape's boundary.
+    enum ShapePreset: String, CaseIterable, Identifiable {
+        case square = "Square"
+        case circle = "Circle"
+        case ellipse = "Ellipse"
+
+        var id: String { rawValue }
+
+        var symbol: String {
+            switch self {
+            case .square: "square"
+            case .circle: "circle"
+            case .ellipse: "oval"
+            }
+        }
+    }
+
     /// A rendered poster ready for previewing and the share sheet.
     /// The identity is stable so re-rendering at a new resolution updates
     /// the presented sheet in place instead of dismissing and re-presenting.
@@ -263,6 +281,8 @@ struct ContentView: View {
     @State private var showHelp = false
     @AppStorage("hasSeenHelpOverlay") private var hasSeenHelpOverlay = false
     @State private var palette: Palette = .mondrian
+    @State private var showPaletteEditor = false
+    @AppStorage("customPalette") private var customPaletteJSON = ""
     @State private var coloringMode: ColoringMode = .palette
     @State private var iterationField: IterationField? = nil
     @State private var fieldImage: CGImage? = nil
@@ -270,8 +290,19 @@ struct ContentView: View {
     @State private var isBuildingField = false
     @State private var fieldProgress: Double = 0
     @State private var iterateScheme: IterateScheme = .border
+    @AppStorage("iterateCount") private var iterateCount = 8
+    @AppStorage("trajectoryLineWidth") private var trajectoryLineWidth = 4.0
+    @AppStorage("hullLineWidth") private var hullLineWidth = 3.0
+    @AppStorage("pointMarkerSize") private var pointMarkerSize = 6.0
+    @State private var showSettings = false
     @State private var startPoints: [CGPoint] = []
     @State private var isEditingIterates = false
+    @State private var isPaintingWedges = false
+    @State private var paintColor: Color = .orange
+    /// User-picked wedge fills, keyed by wedge index. Painted on top of the
+    /// palette's own coloring, and never cleared by theme or run changes —
+    /// the user works on top of the existing canvas.
+    @State private var wedgeOverrides: [Int: Color] = [:]
     @State private var showAddHullPointsAlert = false
     @State private var showOutsideHullWarning = false
     @State private var outsideHullWarningNonce = 0
@@ -287,7 +318,6 @@ struct ContentView: View {
     @State private var soundEngine = SoundEngine()
 
     private let stepsPerSecond: Double = 7
-    private let borderInset: CGFloat = 18
     private let grabRadius: CGFloat = 30
 
     private var hasRun: Bool { !trajectories.isEmpty }
@@ -369,8 +399,10 @@ struct ContentView: View {
         }
         .onChange(of: coloringMode) { _, newMode in
             if newMode == .intensity {
-                // The plot doesn't use the iterate set; leave editing mode.
+                // The plot doesn't use the iterate set or the wedge fills;
+                // leave both editing modes.
                 isEditingIterates = false
+                isPaintingWedges = false
                 // A cleared custom set would leave Run disabled with the
                 // iterate controls hidden — fall back to the default scheme.
                 if startPoints.isEmpty { iterateScheme = .border }
@@ -384,7 +416,14 @@ struct ContentView: View {
             }
         }
         .onChange(of: iterateScheme) { _, newScheme in
-            guard let points = newScheme.points(inHull: convexHull(of: hullPoints)) else { return }
+            guard let points = newScheme.points(inHull: convexHull(of: hullPoints), count: iterateCount) else { return }
+            startPoints = points
+            if hasRun { recompute(animated: false) }
+        }
+        .onChange(of: iterateCount) { _, newCount in
+            // Regenerate the current scheme at the new size; custom sets
+            // are the user's own and stay untouched.
+            guard let points = iterateScheme.points(inHull: convexHull(of: hullPoints), count: newCount) else { return }
             startPoints = points
             if hasRun { recompute(animated: false) }
         }
@@ -396,6 +435,104 @@ struct ContentView: View {
         .sheet(item: $poster) { poster in
             posterSheet(for: poster)
         }
+        .sheet(isPresented: $showSettings) {
+            settingsSheet
+        }
+    }
+
+    /// App settings. Edits apply immediately, so the canvas behind the
+    /// sheet previews new colors and iterate layouts live.
+    private var settingsSheet: some View {
+        NavigationStack {
+            Form {
+                Section("Appearance") {
+                    Picker("Theme", selection: $palette) {
+                        ForEach(Palette.all) { palette in
+                            Text(palette.name).tag(palette)
+                        }
+                        Text("Custom").tag(Palette.custom(from: customPaletteData))
+                    }
+                    Button {
+                        // Switch to the custom palette so edits preview live
+                        // behind the editor.
+                        palette = .custom(from: customPaletteData)
+                        showPaletteEditor = true
+                    } label: {
+                        Label("Customize palette…", systemImage: "slider.horizontal.3")
+                    }
+                    Picker("Coloring", selection: $coloringMode) {
+                        ForEach(ColoringMode.allCases) { mode in
+                            Text(mode.rawValue).tag(mode)
+                        }
+                    }
+                }
+                Section("Trace") {
+                    Toggle(isOn: $showBisector) {
+                        Label("Witness bisector", systemImage: "line.diagonal")
+                    }
+                    Toggle(isOn: $soundOn) {
+                        Label("Sound", systemImage: soundOn ? "speaker.wave.2" : "speaker.slash")
+                    }
+                }
+                Section {
+                    VStack(alignment: .leading) {
+                        LabeledContent("Trajectories", value: trajectoryLineWidth.formatted())
+                        Slider(value: $trajectoryLineWidth, in: 0...10, step: 0.5)
+                    }
+                    VStack(alignment: .leading) {
+                        LabeledContent("Convex hull", value: hullLineWidth.formatted())
+                        Slider(value: $hullLineWidth, in: 0...10, step: 0.5)
+                    }
+                    VStack(alignment: .leading) {
+                        LabeledContent("Point markers", value: pointMarkerSize.formatted())
+                        Slider(value: $pointMarkerSize, in: 0.5...20, step: 0.5)
+                    }
+                } header: {
+                    Text("Line & marker size")
+                } footer: {
+                    Text("A line width of 0 hides that line entirely.")
+                }
+                Section {
+                    Stepper(value: $iterateCount, in: 4...24) {
+                        LabeledContent("Iterates", value: "\(iterateCount)")
+                    }
+                } header: {
+                    Text("Auto-generated iterates")
+                } footer: {
+                    Text("How many starting iterates the schemes generate. Corners uses fewer when the hull has fewer vertices.")
+                }
+            }
+            .navigationTitle("Settings")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { showSettings = false }
+                }
+            }
+            .sheet(isPresented: $showPaletteEditor) {
+                CustomPaletteEditor(data: customPaletteBinding)
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+
+    /// The stored custom palette, falling back to the starter set.
+    private var customPaletteData: CustomPaletteData {
+        CustomPaletteData(json: customPaletteJSON) ?? .initial
+    }
+
+    /// Writes edits back to storage and, when the custom palette is the one
+    /// on screen, applies them immediately so the canvas previews live.
+    private var customPaletteBinding: Binding<CustomPaletteData> {
+        Binding(
+            get: { customPaletteData },
+            set: { newValue in
+                customPaletteJSON = newValue.jsonString
+                if palette.id == "Custom" {
+                    palette = .custom(from: newValue)
+                }
+            }
+        )
     }
 
     // MARK: Overlays
@@ -432,11 +569,13 @@ struct ContentView: View {
     private var topOverlay: some View {
         VStack(spacing: 10) {
             HStack(alignment: .top, spacing: 10) {
-                themeMenu
                 // The intensity plot ignores the iterate set, so editing
                 // controls only appear in palette mode.
                 if coloringMode == .palette {
                     iterateMenu
+                }
+                if coloringMode == .palette && hasRun {
+                    paintButton
                 }
                 Spacer()
                 resultDot
@@ -491,9 +630,41 @@ struct ContentView: View {
         }
     }
 
+    /// Enters wedge-painting mode, where a tap fills the wedge under the
+    /// finger with the chosen color, layered over the palette's coloring.
+    private var paintButton: some View {
+        Button {
+            isPaintingWedges.toggle()
+            if isPaintingWedges { isEditingIterates = false }
+        } label: {
+            Image(systemName: isPaintingWedges ? "paintbrush.fill" : "paintbrush")
+        }
+        .buttonStyle(.glass)
+        .accessibilityLabel(isPaintingWedges ? "Stop painting wedges" : "Paint wedges")
+    }
+
     @ViewBuilder
     private var statusChip: some View {
-        if isEditingIterates && !isAnimating {
+        if isPaintingWedges && !isAnimating {
+            HStack(spacing: 12) {
+                ColorPicker("Wedge color", selection: $paintColor, supportsOpacity: false)
+                    .labelsHidden()
+                    .frame(width: 32)
+                Label("Tap a wedge to paint it", systemImage: "hand.tap")
+                Button("Clear", role: .destructive) {
+                    wedgeOverrides = [:]
+                }
+                .disabled(wedgeOverrides.isEmpty)
+                Button("Done") {
+                    isPaintingWedges = false
+                }
+                .font(.subheadline.bold())
+            }
+            .font(.subheadline)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .glassEffect()
+        } else if isEditingIterates && !isAnimating {
             HStack(spacing: 12) {
                 if showOutsideHullWarning {
                     Label("Place iterates inside the hull", systemImage: "exclamationmark.triangle.fill")
@@ -539,26 +710,6 @@ struct ContentView: View {
         }
     }
 
-    private var themeMenu: some View {
-        Menu {
-            Picker("Theme", selection: $palette) {
-                ForEach(Palette.all) { palette in
-                    Text(palette.name).tag(palette)
-                }
-            }
-            Divider()
-            Picker("Coloring", selection: $coloringMode) {
-                ForEach(ColoringMode.allCases) { mode in
-                    Text(mode.rawValue).tag(mode)
-                }
-            }
-        } label: {
-            Image(systemName: "paintpalette")
-        }
-        .buttonStyle(.glass)
-        .accessibilityLabel("Color theme")
-    }
-
     private var iterateMenu: some View {
         Menu {
             Picker("Iterates", selection: $iterateScheme) {
@@ -595,6 +746,7 @@ struct ContentView: View {
                     showAddHullPointsAlert = true
                 } else {
                     isEditingIterates = wantsOn
+                    if wantsOn { isPaintingWedges = false }
                 }
             }
         )
@@ -638,7 +790,7 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Kalantari's Triangle Algorithm")
                 .font(.headline)
-            Text("Iterates start from a configurable set of points inside the convex hull — its vertices and edge midpoints by default. Each step finds a pivot vertex v with d(x, v) ≥ d(p, v) and jumps to the point on the segment [x, v] closest to the target p.")
+            Text("Iterates start from a configurable set of points inside the convex hull — evenly spaced along its border by default. Each step finds a pivot vertex v with d(x, v) ≥ d(p, v) and jumps to the point on the segment [x, v] closest to the target p.")
             Text("If an iterate gets within ε of the target, the point is in the hull. If no pivot exists, the iterate is a witness — proof the point is outside.")
             Divider()
             Text("Intensity plot")
@@ -689,11 +841,7 @@ struct ContentView: View {
                 .buttonStyle(.glassProminent)
                 .disabled(hullPoints.isEmpty || queryPoint == nil || startPoints.isEmpty || isAnimating)
 
-                Button(action: randomExample) {
-                    Image(systemName: "die.face.5")
-                }
-                .buttonStyle(.glass)
-                .accessibilityLabel("Random example")
+                shapeMenu
 
                 Button(action: undo) {
                     Image(systemName: "arrow.uturn.backward")
@@ -707,6 +855,28 @@ struct ContentView: View {
         }
     }
 
+    /// Replaces the vertex set S: random points on the boundary of a preset
+    /// shape, or a fully random example composition.
+    private var shapeMenu: some View {
+        Menu {
+            ForEach(ShapePreset.allCases) { shape in
+                Button {
+                    applyShapePreset(shape)
+                } label: {
+                    Label(shape.rawValue, systemImage: shape.symbol)
+                }
+            }
+            Divider()
+            Button(action: randomExample) {
+                Label("Random", systemImage: "die.face.5")
+            }
+        } label: {
+            Image(systemName: "square.on.circle")
+        }
+        .buttonStyle(.glass)
+        .accessibilityLabel("Shape presets")
+    }
+
     /// Secondary actions folded into one overflow button so the bar stays
     /// uncrowded on small screens.
     private var moreMenu: some View {
@@ -716,11 +886,11 @@ struct ContentView: View {
             } label: {
                 Label("Ambient mode", systemImage: "sparkles")
             }
-            Toggle(isOn: $soundOn) {
-                Label("Sound", systemImage: soundOn ? "speaker.wave.2" : "speaker.slash")
-            }
-            Toggle(isOn: $showBisector) {
-                Label("Witness bisector", systemImage: "line.diagonal")
+            Divider()
+            Button {
+                showSettings = true
+            } label: {
+                Label("Settings", systemImage: "gearshape")
             }
             Divider()
             Button(role: .destructive, action: clearAll) {
@@ -759,6 +929,12 @@ struct ContentView: View {
         .onTapGesture { location in
             if isAmbient {
                 isAmbient = false
+                return
+            }
+            if isPaintingWedges {
+                if let index = wedgeIndex(at: location) {
+                    wedgeOverrides[index] = paintColor
+                }
                 return
             }
             guard target(near: location) == nil else { return }
@@ -858,12 +1034,12 @@ struct ContentView: View {
             return
         }
         if iterateScheme == .custom || iterateScheme.isRandom {
-            if startPoints.isEmpty, let generated = iterateScheme.points(inHull: hull) {
+            if startPoints.isEmpty, let generated = iterateScheme.points(inHull: hull, count: iterateCount) {
                 startPoints = generated
             } else {
                 startPoints = startPoints.map { clampToConvexHull($0, hull: hull) }
             }
-        } else if let generated = iterateScheme.points(inHull: hull) {
+        } else if let generated = iterateScheme.points(inHull: hull, count: iterateCount) {
             startPoints = generated
         }
     }
@@ -949,7 +1125,7 @@ struct ContentView: View {
         // A random scheme samples a fresh set on every animated run, so each
         // Run/Replay composes a new picture.
         if animated, iterateScheme.isRandom,
-           let fresh = iterateScheme.points(inHull: convexHull(of: hullPoints)),
+           let fresh = iterateScheme.points(inHull: convexHull(of: hullPoints), count: iterateCount),
            !fresh.isEmpty {
             startPoints = fresh
         }
@@ -1033,6 +1209,8 @@ struct ContentView: View {
         runStart = nil
         isAnimating = false
         isEditingIterates = false
+        isPaintingWedges = false
+        wedgeOverrides = [:]
         syncIteratesToHull()
         cancelFieldBuild()
         iterationField = nil
@@ -1057,6 +1235,79 @@ struct ContentView: View {
             x: CGFloat.random(in: 0.1 * w...0.9 * w),
             y: CGFloat.random(in: 0.15 * h...0.78 * h)
         )
+        syncIteratesToHull()
+        recompute(animated: true)
+    }
+
+    /// Replaces the hull's vertex set with random points on the boundary of
+    /// the chosen shape, centered in the same canvas region the random
+    /// example uses so the overlays don't cover it.
+    ///
+    /// Sampling is stratified: the boundary is split into as many equal
+    /// segments as there are points and each point lands at a random spot
+    /// within its own segment. That keeps the placement random while
+    /// guaranteeing the whole outline is covered, so the hull actually
+    /// reads as the chosen shape instead of an irregular polygon.
+    private func applyShapePreset(_ shape: ShapePreset) {
+        guard canvasSize != .zero else { return }
+        let center = CGPoint(x: canvasSize.width / 2, y: 0.46 * canvasSize.height)
+        let maxRadiusX = 0.35 * canvasSize.width
+        let maxRadiusY = 0.26 * canvasSize.height
+
+        // Roughly one point per 18 points of perimeter — enough that the
+        // largest gap between neighbors stays visually smooth.
+        func sampleCount(forPerimeter perimeter: CGFloat) -> Int {
+            max(24, min(64, Int(perimeter / 18)))
+        }
+
+        let points: [CGPoint]
+        switch shape {
+        case .circle:
+            let radius = min(maxRadiusX, maxRadiusY)
+            let count = sampleCount(forPerimeter: 2 * .pi * radius)
+            points = (0..<count).map { i in
+                let angle = (Double(i) + .random(in: 0..<1)) * 2 * .pi / Double(count)
+                return CGPoint(x: center.x + radius * cos(angle),
+                               y: center.y + radius * sin(angle))
+            }
+        case .ellipse:
+            // Ramanujan's perimeter approximation.
+            let a = maxRadiusX, b = maxRadiusY
+            let perimeter = CGFloat.pi * (3 * (a + b) - sqrt((3 * a + b) * (a + 3 * b)))
+            let count = sampleCount(forPerimeter: perimeter)
+            points = (0..<count).map { i in
+                let angle = (Double(i) + .random(in: 0..<1)) * 2 * .pi / Double(count)
+                return CGPoint(x: center.x + a * cos(angle),
+                               y: center.y + b * sin(angle))
+            }
+        case .square:
+            let half = min(maxRadiusX, maxRadiusY)
+            let rect = CGRect(x: center.x - half, y: center.y - half,
+                              width: half * 2, height: half * 2)
+            let side = half * 2
+            // The corners pin the true outline; the stratified edge points
+            // fill in the rest of the vertex set.
+            let corners = [CGPoint(x: rect.minX, y: rect.minY),
+                           CGPoint(x: rect.maxX, y: rect.minY),
+                           CGPoint(x: rect.maxX, y: rect.maxY),
+                           CGPoint(x: rect.minX, y: rect.maxY)]
+            let count = sampleCount(forPerimeter: 4 * side)
+            let edgePoints = (0..<count).map { i -> CGPoint in
+                let t = (CGFloat(i) + .random(in: 0..<1)) * 4 * side / CGFloat(count)
+                if t < side {
+                    return CGPoint(x: rect.minX + t, y: rect.minY)
+                } else if t < 2 * side {
+                    return CGPoint(x: rect.maxX, y: rect.minY + t - side)
+                } else if t < 3 * side {
+                    return CGPoint(x: rect.maxX - (t - 2 * side), y: rect.maxY)
+                } else {
+                    return CGPoint(x: rect.minX, y: rect.maxY - (t - 3 * side))
+                }
+            }
+            points = corners + edgePoints
+        }
+
+        hullPoints = points
         syncIteratesToHull()
         recompute(animated: true)
     }
@@ -1236,7 +1487,8 @@ struct ContentView: View {
         // so they only appear while the user is editing the iterate set.
         guard isEditingIterates || (hasRun && coloringMode == .palette) else { return }
         for (index, point) in startPoints.enumerated() {
-            let half: CGFloat = activeDrag == .start(index) ? 8 : 5
+            let base = pointMarkerSize * 0.8
+            let half: CGFloat = activeDrag == .start(index) ? base + 3 : base
             let square = CGRect(x: point.x - half, y: point.y - half,
                                 width: half * 2, height: half * 2)
             context.fill(Path(roundedRect: square, cornerRadius: 1), with: .color(palette.line))
@@ -1257,12 +1509,13 @@ struct ContentView: View {
         path.move(to: hull[0])
         for point in hull.dropFirst() { path.addLine(to: point) }
         path.closeSubpath()
-        context.stroke(path, with: .color(palette.line), lineWidth: 3)
+        guard hullLineWidth > 0 else { return }
+        context.stroke(path, with: .color(palette.line), lineWidth: hullLineWidth)
     }
 
     private func drawHullPoints(in context: inout GraphicsContext) {
         for (index, point) in hullPoints.enumerated() {
-            let radius: CGFloat = activeDrag == .hull(index) ? 9 : 6
+            let radius: CGFloat = activeDrag == .hull(index) ? pointMarkerSize + 3 : pointMarkerSize
             let rect = CGRect(x: point.x - radius, y: point.y - radius,
                               width: radius * 2, height: radius * 2)
             context.fill(Path(ellipseIn: rect), with: .color(palette.vertex))
@@ -1272,7 +1525,8 @@ struct ContentView: View {
 
     private func drawQueryPoint(in context: inout GraphicsContext) {
         guard let p = queryPoint else { return }
-        let radius: CGFloat = activeDrag == .query ? 8 : 5
+        let base = pointMarkerSize * 0.8
+        let radius: CGFloat = activeDrag == .query ? base + 3 : base
         let rect = CGRect(x: p.x - radius, y: p.y - radius,
                           width: radius * 2, height: radius * 2)
         context.fill(Path(ellipseIn: rect), with: .color(palette.target))
@@ -1287,12 +1541,15 @@ struct ContentView: View {
             guard !points.isEmpty else { continue }
 
             // Angular bars, in the manner of the painter's grid lines.
+            // Width 0 hides the polylines and leaves just the markers.
             let (path, tip) = partialPolyline(points, upTo: progress)
-            context.stroke(
-                path,
-                with: .color(palette.line),
-                style: StrokeStyle(lineWidth: 4, lineCap: .butt, lineJoin: .miter)
-            )
+            if trajectoryLineWidth > 0 {
+                context.stroke(
+                    path,
+                    with: .color(palette.line),
+                    style: StrokeStyle(lineWidth: trajectoryLineWidth, lineCap: .butt, lineJoin: .miter)
+                )
+            }
 
             let fullyRevealed = progress >= Double(points.count - 1)
 
@@ -1352,28 +1609,54 @@ struct ContentView: View {
 
         // Neutral slices first so accents paint over them where trajectories
         // cross each other. Nonzero winding keeps self-overlapping slices solid.
-        func slice(_ i: Int) -> PaletteSlice {
-            palette.slices[i % palette.slices.count]
-        }
-        let order = trajectories.indices.sorted { slice($0).isNeutral && !slice($1).isNeutral }
+        let order = trajectories.indices.sorted { paletteSlice($0).isNeutral && !paletteSlice($1).isNeutral }
 
         for i in order {
-            let a = revealedPoints(trajectories[i].points, upTo: progress)
-            let b = revealedPoints(trajectories[(i + 1) % n].points, upTo: progress)
-            guard let aStart = a.first, !b.isEmpty else { continue }
-            var path = Path()
-            path.move(to: aStart)
-            for point in a.dropFirst() { path.addLine(to: point) }
-            for point in b.reversed() { path.addLine(to: point) }
-            path.closeSubpath()
-            context.fill(path, with: .color(slice(i).color))
+            guard let path = wedgePath(i, upTo: progress) else { continue }
+            context.fill(path, with: .color(paletteSlice(i).color))
         }
 
-        // Frame on the inset rect the traces start from, like a canvas edge.
-        let frame = CGRect(x: borderInset, y: borderInset,
-                           width: size.width - 2 * borderInset,
-                           height: size.height - 2 * borderInset)
-        context.stroke(Path(frame), with: .color(palette.line), lineWidth: 3)
+        // The user's hand-painted fills go on top of the palette's coloring,
+        // leaving every unpainted wedge exactly as it was.
+        for i in trajectories.indices {
+            guard let color = wedgeOverrides[i],
+                  let path = wedgePath(i, upTo: progress) else { continue }
+            context.fill(path, with: .color(color))
+        }
+    }
+
+    private func paletteSlice(_ i: Int) -> PaletteSlice {
+        palette.slices[i % palette.slices.count]
+    }
+
+    /// The region between trajectory `i` and its neighbor, as drawn by
+    /// `drawMondrianRegions` — shared by drawing and wedge hit-testing.
+    private func wedgePath(_ i: Int, upTo progress: Double = .infinity) -> Path? {
+        let n = trajectories.count
+        guard n >= 2 else { return nil }
+        let a = revealedPoints(trajectories[i].points, upTo: progress)
+        let b = revealedPoints(trajectories[(i + 1) % n].points, upTo: progress)
+        guard let aStart = a.first, !b.isEmpty else { return nil }
+        var path = Path()
+        path.move(to: aStart)
+        for point in a.dropFirst() { path.addLine(to: point) }
+        for point in b.reversed() { path.addLine(to: point) }
+        path.closeSubpath()
+        return path
+    }
+
+    /// The wedge under `location`, checking the visually topmost first:
+    /// painted wedges sit above accents, which sit above neutrals.
+    private func wedgeIndex(at location: CGPoint) -> Int? {
+        let n = trajectories.count
+        guard n >= 2 else { return nil }
+        let order = trajectories.indices.sorted { paletteSlice($0).isNeutral && !paletteSlice($1).isNeutral }
+        let painted = trajectories.indices.filter { wedgeOverrides[$0] != nil }.sorted(by: >)
+        let unpainted = order.reversed().filter { wedgeOverrides[$0] == nil }
+        for i in painted + unpainted {
+            if let path = wedgePath(i), path.contains(location) { return i }
+        }
+        return nil
     }
 
     /// Paints the iteration-count field sampled across the whole canvas:
@@ -1388,10 +1671,6 @@ struct ContentView: View {
                           height: CGFloat(field.rows) * field.cellSize)
         let image = Image(decorative: bitmap, scale: 1).interpolation(.medium)
         context.draw(image, in: rect)
-        let frame = CGRect(x: borderInset, y: borderInset,
-                           width: size.width - 2 * borderInset,
-                           height: size.height - 2 * borderInset)
-        context.stroke(Path(frame), with: .color(palette.line), lineWidth: 3)
     }
 
     /// The iterate points revealed at `progress`, with the tip interpolated

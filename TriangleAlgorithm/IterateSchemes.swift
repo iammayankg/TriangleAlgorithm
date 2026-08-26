@@ -26,9 +26,14 @@ enum IterateScheme: String, CaseIterable, Identifiable {
     /// Generates the starting iterates for the given convex hull. Returns
     /// nil for `.custom`, whose points are owned by the user and never
     /// regenerated, and an empty set when the hull has no interior yet.
-    func points(inHull hull: [CGPoint]) -> [CGPoint]? {
+    ///
+    /// `count` sets how many iterates every scheme produces. Corners caps
+    /// at the hull's own vertex count when the hull has fewer than `count`
+    /// vertices.
+    func points(inHull hull: [CGPoint], count: Int = 8) -> [CGPoint]? {
         guard self != .custom else { return nil }
         guard hull.count >= 3 else { return [] }
+        let count = max(1, count)
 
         let xs = hull.map(\.x)
         let ys = hull.map(\.y)
@@ -40,37 +45,61 @@ enum IterateScheme: String, CaseIterable, Identifiable {
 
         switch self {
         case .border:
-            // The hull's vertices and edge midpoints.
-            return hull.indices.flatMap { i -> [CGPoint] in
+            // `count` points evenly spaced along the hull's perimeter, so
+            // the iterate count stays the configured size no matter how
+            // many vertices the hull has (e.g. a sampled shape preset).
+            let segments = hull.indices.map { i -> (start: CGPoint, end: CGPoint, length: CGFloat) in
                 let a = hull[i]
                 let b = hull[(i + 1) % hull.count]
-                return [a, CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2)]
+                return (a, b, distance(a, b))
+            }
+            let perimeter = segments.reduce(0) { $0 + $1.length }
+            guard perimeter > 0 else { return Array(repeating: hull[0], count: count) }
+            return (0..<count).map { i in
+                var remaining = perimeter * CGFloat(i) / CGFloat(count)
+                for segment in segments {
+                    if remaining <= segment.length, segment.length > 0 {
+                        let t = remaining / segment.length
+                        return CGPoint(x: segment.start.x + (segment.end.x - segment.start.x) * t,
+                                       y: segment.start.y + (segment.end.y - segment.start.y) * t)
+                    }
+                    remaining -= segment.length
+                }
+                return hull[0]
             }
         case .corners:
-            return hull
+            // Every hull vertex, or an evenly spaced subsample when the
+            // hull has more vertices than the configured count.
+            guard hull.count > count else { return hull }
+            return (0..<count).map { hull[$0 * hull.count / count] }
         case .ring:
             // Ellipse inscribed in the hull's bounding box, clamped inside.
-            return (0..<8).map { i in
-                let angle = CGFloat(i) / 8 * 2 * .pi - .pi / 2
+            return (0..<count).map { i in
+                let angle = CGFloat(i) / CGFloat(count) * 2 * .pi - .pi / 2
                 let point = CGPoint(x: bounds.midX + bounds.width / 2 * cos(angle),
                                     y: bounds.midY + bounds.height / 2 * sin(angle))
                 return clampToConvexHull(point, hull: hull)
             }
         case .grid:
-            // 3×3 lattice over the hull's bounding box, clamped inside.
-            return (0..<3).flatMap { row in
-                (0..<3).map { column in
-                    let point = CGPoint(x: bounds.minX + bounds.width * CGFloat(column) / 2,
-                                        y: bounds.minY + bounds.height * CGFloat(row) / 2)
+            // A near-square lattice of about `count` points over the hull's
+            // bounding box, clamped inside.
+            let columns = max(2, Int(Double(count).squareRoot().rounded()))
+            let rows = max(2, Int((Double(count) / Double(columns)).rounded(.up)))
+            return (0..<rows).flatMap { row in
+                (0..<columns).map { column in
+                    let point = CGPoint(
+                        x: bounds.minX + bounds.width * CGFloat(column) / CGFloat(columns - 1),
+                        y: bounds.minY + bounds.height * CGFloat(row) / CGFloat(rows - 1)
+                    )
                     return clampToConvexHull(point, hull: hull)
                 }
             }
         case .spiral:
-            // 10 points along two turns of an Archimedean spiral growing
+            // Points along two turns of an Archimedean spiral growing
             // outward from the hull's centroid, clamped inside.
             let maxRadius = min(bounds.width, bounds.height) / 2
-            return (1...10).map { i in
-                let t = CGFloat(i) / 10
+            return (1...count).map { i in
+                let t = CGFloat(i) / CGFloat(count)
                 let angle = t * 4 * .pi
                 let point = CGPoint(x: centroid.x + maxRadius * t * cos(angle),
                                     y: centroid.y + maxRadius * t * sin(angle))
@@ -81,13 +110,13 @@ enum IterateScheme: String, CaseIterable, Identifiable {
             // hulls fall back to the centroid so the count always comes out.
             var points: [CGPoint] = []
             var attempts = 0
-            while points.count < 8 && attempts < 400 {
+            while points.count < count && attempts < count * 50 {
                 attempts += 1
                 let candidate = CGPoint(x: .random(in: bounds.minX...bounds.maxX),
                                         y: .random(in: bounds.minY...bounds.maxY))
                 if isInsideConvexHull(candidate, hull: hull) { points.append(candidate) }
             }
-            while points.count < 8 { points.append(centroid) }
+            while points.count < count { points.append(centroid) }
             return points
         case .custom:
             return nil
