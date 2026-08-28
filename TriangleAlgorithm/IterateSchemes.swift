@@ -11,6 +11,7 @@ import SwiftUI
 enum IterateScheme: String, CaseIterable, Identifiable {
     case border = "Border"
     case corners = "Corners"
+    case pointsOfS = "Points of S"
     case ring = "Ring"
     case grid = "Grid"
     case spiral = "Spiral"
@@ -29,8 +30,10 @@ enum IterateScheme: String, CaseIterable, Identifiable {
     ///
     /// `count` sets how many iterates every scheme produces. Corners caps
     /// at the hull's own vertex count when the hull has fewer than `count`
-    /// vertices.
-    func points(inHull hull: [CGPoint], count: Int = 8) -> [CGPoint]? {
+    /// vertices. Points of S ignores `count` and starts one iterate at
+    /// every point of `vertices` — the full set S, including any points
+    /// interior to the hull.
+    func points(inHull hull: [CGPoint], vertices: [CGPoint] = [], count: Int = 8) -> [CGPoint]? {
         guard self != .custom else { return nil }
         guard hull.count >= 3 else { return [] }
         let count = max(1, count)
@@ -72,6 +75,18 @@ enum IterateScheme: String, CaseIterable, Identifiable {
             // hull has more vertices than the configured count.
             guard hull.count > count else { return hull }
             return (0..<count).map { hull[$0 * hull.count / count] }
+        case .pointsOfS:
+            // Every point of S exactly as placed, hull vertices and
+            // interior points alike. Ordered by angle around the set's
+            // centroid so consecutive trajectories are geometric neighbors
+            // and the wedge fills between them nest instead of criss-
+            // crossing when the points were placed out of order.
+            let source = vertices.isEmpty ? hull : vertices
+            let center = CGPoint(x: source.map(\.x).reduce(0, +) / CGFloat(source.count),
+                                 y: source.map(\.y).reduce(0, +) / CGFloat(source.count))
+            return source.sorted {
+                atan2($0.y - center.y, $0.x - center.x) < atan2($1.y - center.y, $1.x - center.x)
+            }
         case .ring:
             // Ellipse inscribed in the hull's bounding box, clamped inside.
             return (0..<count).map { i in

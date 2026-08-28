@@ -26,6 +26,18 @@ final class SoundEngine {
     private var pendingBuffer: AVAudioPCMBuffer?
 
     func play(voices: [Voice], stepsPerSecond: Double) {
+#if targetEnvironment(simulator)
+        // The simulator's audio stack intermittently times out inside
+        // AVAudioEngine.start() and aborts the process (an uncatchable
+        // AudioToolbox RPC failure), sometimes taking the whole simulator
+        // down. Sound is a device-only feature.
+        return
+#else
+        playRendered(voices: voices, stepsPerSecond: stepsPerSecond)
+#endif
+    }
+
+    private func playRendered(voices: [Voice], stepsPerSecond: Double) {
         guard let buffer = renderScore(voices: voices, stepsPerSecond: stepsPerSecond) else { return }
         if isReady {
             playNow(buffer)

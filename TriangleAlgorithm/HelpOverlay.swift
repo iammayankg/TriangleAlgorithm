@@ -5,6 +5,9 @@ import SwiftUI
 /// info popover.
 struct HelpOverlay: View {
     let dismiss: () -> Void
+    /// When provided, the overlay offers to hand off to the interactive
+    /// walkthrough instead of just being read.
+    var startTutorial: (() -> Void)? = nil
 
     var body: some View {
         ZStack {
@@ -19,6 +22,8 @@ struct HelpOverlay: View {
                             .font(.title2.bold())
                             .frame(maxWidth: .infinity, alignment: .center)
 
+                        row(icon: "square.grid.2x2", title: "Pick a mode",
+                            detail: "Basic traces one path in a triangle, slowly, pointing out each pivot vertex. Paths traces many starting iterates at once. Regions fills the areas between paths with a palette. Partition colors every point of the hull by the vertex it pivots to first.")
                         row(icon: "hand.tap", title: "Build a hull",
                             detail: "Tap the canvas to drop points — you need at least three. Drag any dot to reshape the hull; the buttons below undo or clear.")
                         row(icon: "circlebadge.fill", title: "Place the target",
@@ -36,16 +41,25 @@ struct HelpOverlay: View {
                         row(icon: "square.grid.3x3.topleft.filled", title: "Shape the iterates",
                             detail: "In slice mode, choose how the starting iterates are laid out — border, ring, spiral, random — or edit them by hand. They always live inside the hull.")
                         row(icon: "sparkles", title: "And more",
-                            detail: "The shapes menu drops a square, circle, ellipse, or random example onto the canvas; ambient mode composes endlessly until you tap, and the share button exports your run as a poster.")
+                            detail: "The shapes menu drops a square, circle, ellipse, diamond, pentagon, hexagon, star, or random example onto the canvas; ambient mode composes endlessly until you tap, and the share button exports your run as a poster.")
                     }
                     .padding(24)
                 }
 
-                Button(action: dismiss) {
-                    Text("Got it")
-                        .frame(minWidth: 160)
+                VStack(spacing: 10) {
+                    if let startTutorial {
+                        Button(action: startTutorial) {
+                            Label("Start interactive tutorial", systemImage: "graduationcap")
+                                .frame(minWidth: 200)
+                        }
+                        .buttonStyle(.glassProminent)
+                    }
+                    Button(action: dismiss) {
+                        Text("Got it")
+                            .frame(minWidth: 200)
+                    }
+                    .buttonStyle(.glass)
                 }
-                .buttonStyle(.glassProminent)
                 .padding(.vertical, 18)
             }
             .frame(maxWidth: 440, maxHeight: 600)

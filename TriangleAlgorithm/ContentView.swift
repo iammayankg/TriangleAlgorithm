@@ -93,6 +93,9 @@ nonisolated func clampToConvexHull(_ point: CGPoint, hull: [CGPoint]) -> CGPoint
 struct Trajectory: Identifiable {
     let id = UUID()
     let points: [CGPoint]
+    /// The pivot vertex used for each step: `pivots[i]` carried the iterate
+    /// from `points[i]` to `points[i + 1]`.
+    let pivots: [CGPoint]
     /// True if the iterate got within epsilon of the query point;
     /// false means the final point is a witness (proof of non-membership).
     let converged: Bool
@@ -102,42 +105,54 @@ enum TriangleAlgorithm {
     /// Traces iterates from `start` toward query point `p` over the vertex set.
     /// Each step pivots on a vertex v with d(x, v) >= d(p, v) and moves to the
     /// point on segment [x, v] nearest to p. Stops with a witness if no pivot exists.
+    /// One iteration from `x`: the best valid pivot and the point on
+    /// segment [x, pivot] nearest to p. Nil when no pivot exists (x is a
+    /// witness) — the shared kernel of `trace`, `stepCount`, and the
+    /// partition mode.
+    nonisolated static func step(
+        from x: CGPoint,
+        vertices: [CGPoint],
+        target p: CGPoint
+    ) -> (next: CGPoint, pivotIndex: Int, gap: CGFloat)? {
+        var best: (next: CGPoint, pivotIndex: Int, gap: CGFloat)? = nil
+        for (index, v) in vertices.enumerated() where distance(x, v) >= distance(p, v) {
+            let candidate = closestPointOnSegment(from: x, to: v, target: p)
+            let gap = distance(candidate, p)
+            if gap < (best?.gap ?? .greatestFiniteMagnitude) {
+                best = (candidate, index, gap)
+            }
+        }
+        return best
+    }
+
     nonisolated static func trace(
         from start: CGPoint,
         vertices: [CGPoint],
         target p: CGPoint,
         epsilon: CGFloat = 1.0,
         maxIterations: Int = 500
-    ) -> (points: [CGPoint], converged: Bool) {
+    ) -> (points: [CGPoint], pivots: [CGPoint], converged: Bool) {
         var x = start
         var path = [x]
-        guard !vertices.isEmpty else { return (path, false) }
+        var pivots: [CGPoint] = []
+        guard !vertices.isEmpty else { return (path, pivots, false) }
 
         for _ in 0..<maxIterations {
             let currentGap = distance(x, p)
-            if currentGap <= epsilon { return (path, true) }
+            if currentGap <= epsilon { return (path, pivots, true) }
 
             // Among all valid pivots, greedily take the one whose segment
             // projection lands nearest to p.
-            var bestNext: CGPoint? = nil
-            var bestGap = CGFloat.greatestFiniteMagnitude
-            for v in vertices where distance(x, v) >= distance(p, v) {
-                let candidate = closestPointOnSegment(from: x, to: v, target: p)
-                let gap = distance(candidate, p)
-                if gap < bestGap {
-                    bestGap = gap
-                    bestNext = candidate
-                }
-            }
-
             // No pivot (or no progress possible): x is a witness.
-            guard let next = bestNext, bestGap < currentGap else {
-                return (path, false)
+            guard let step = step(from: x, vertices: vertices, target: p),
+                  step.gap < currentGap else {
+                return (path, pivots, false)
             }
-            x = next
+            x = step.next
             path.append(x)
+            pivots.append(vertices[step.pivotIndex])
         }
-        return (path, distance(x, p) <= epsilon)
+        return (path, pivots, distance(x, p) <= epsilon)
     }
 
     /// Like `trace`, but only counts steps — cheap enough to sample many
@@ -154,18 +169,9 @@ enum TriangleAlgorithm {
         for iteration in 0..<maxIterations {
             let currentGap = distance(x, p)
             if currentGap <= epsilon { return iteration }
-            var bestNext: CGPoint? = nil
-            var bestGap = CGFloat.greatestFiniteMagnitude
-            for v in vertices where distance(x, v) >= distance(p, v) {
-                let candidate = closestPointOnSegment(from: x, to: v, target: p)
-                let gap = distance(candidate, p)
-                if gap < bestGap {
-                    bestGap = gap
-                    bestNext = candidate
-                }
-            }
-            guard let next = bestNext, bestGap < currentGap else { return iteration }
-            x = next
+            guard let step = step(from: x, vertices: vertices, target: p),
+                  step.gap < currentGap else { return iteration }
+            x = step.next
         }
         return maxIterations
     }
@@ -210,9 +216,67 @@ struct IterationField {
     }
 }
 
+/// A grid recording which hull vertex is the first pivot at each sampled
+/// point, backing the partition mode's region coloring. -1 marks cells
+/// outside the hull (or with no pivot), which stay transparent.
+struct PartitionField {
+    let cellSize: CGFloat
+    let columns: Int
+    let rows: Int
+    let pivotIndices: [Int]
+
+    /// Renders the partition into a bitmap with one pixel per cell, each
+    /// pivot's region filled with its own color.
+    func makeImage(colors: [UIColor]) -> CGImage? {
+        guard !colors.isEmpty else { return nil }
+        var components: [(r: CGFloat, g: CGFloat, b: CGFloat, a: CGFloat)] = colors.map { color in
+            var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+            color.getRed(&r, green: &g, blue: &b, alpha: &a)
+            return (r, g, b, a)
+        }
+        // Soften the fills so the hull outline and arrows stay readable.
+        components = components.map { ($0.r, $0.g, $0.b, $0.a * 0.55) }
+        var pixels = [UInt8](repeating: 0, count: columns * rows * 4)
+        for index in pivotIndices.indices {
+            let pivot = pivotIndices[index]
+            guard pivot >= 0 else { continue }
+            let c = components[pivot % components.count]
+            let offset = index * 4
+            pixels[offset] = UInt8(max(0, min(255, c.r * c.a * 255)))
+            pixels[offset + 1] = UInt8(max(0, min(255, c.g * c.a * 255)))
+            pixels[offset + 2] = UInt8(max(0, min(255, c.b * c.a * 255)))
+            pixels[offset + 3] = UInt8(max(0, min(255, c.a * 255)))
+        }
+        return pixels.withUnsafeMutableBytes { buffer in
+            CGContext(data: buffer.baseAddress, width: columns, height: rows,
+                      bitsPerComponent: 8, bytesPerRow: columns * 4,
+                      space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)?
+                .makeImage()
+        }
+    }
+}
+
 // MARK: - Content view
 
 struct ContentView: View {
+    /// The app's feature tiers, from a single demonstrated path up to the
+    /// full generative canvas. Each mode reveals only the controls it needs.
+    enum AppMode: String, CaseIterable, Identifiable {
+        /// One triangle, one target, one start iterate — the algorithm
+        /// itself, traced slowly with each pivot pointed out.
+        case basic = "Basic"
+        /// Many starting iterates on the hull border, plain paths.
+        case paths = "Paths"
+        /// The colored version: regions between paths filled from a palette.
+        case regions = "Regions"
+        /// One iteration from every point of the hull, colored by which
+        /// vertex serves as the first pivot.
+        case partition = "Partition"
+
+        var id: String { rawValue }
+    }
+
     enum DragTarget: Hashable {
         case query
         case hull(Int)
@@ -225,6 +289,10 @@ struct ContentView: View {
         case square = "Square"
         case circle = "Circle"
         case ellipse = "Ellipse"
+        case diamond = "Diamond"
+        case pentagon = "Pentagon"
+        case hexagon = "Hexagon"
+        case star = "Star"
 
         var id: String { rawValue }
 
@@ -233,6 +301,116 @@ struct ContentView: View {
             case .square: "square"
             case .circle: "circle"
             case .ellipse: "oval"
+            case .diamond: "diamond"
+            case .pentagon: "pentagon"
+            case .hexagon: "hexagon"
+            case .star: "star"
+            }
+        }
+    }
+
+    /// The interactive walkthroughs, one flow per mode. Each step drives
+    /// the real canvas and, where possible, advances on the user's own
+    /// action — placing the third triangle point, a trace finishing, a
+    /// wedge getting painted — with a Next button as the manual fallback.
+    enum TutorialStep: Int, CaseIterable {
+        // Basic: the algorithm itself, one slow trace at a time.
+        case placeTriangle
+        case dragTarget
+        case runIt
+        case watchTrace
+        case readResult
+        case tryOtherSide
+        case explore
+        // Paths: a whole set of starting iterates at once.
+        case pathsLoadShape
+        case pathsWatch
+        case pathsSchemes
+        case pathsLive
+        // Regions: coloring the areas between neighboring paths.
+        case regionsLoadShape
+        case regionsWatch
+        case regionsPaint
+        case regionsThemes
+        // Partition: the hull colored by each point's first pivot.
+        case partitionRun
+        case partitionRead
+        case partitionLive
+
+        /// The mode whose walkthrough this step belongs to.
+        var flow: AppMode {
+            switch self {
+            case .placeTriangle, .dragTarget, .runIt, .watchTrace,
+                 .readResult, .tryOtherSide, .explore: .basic
+            case .pathsLoadShape, .pathsWatch, .pathsSchemes, .pathsLive: .paths
+            case .regionsLoadShape, .regionsWatch, .regionsPaint, .regionsThemes: .regions
+            case .partitionRun, .partitionRead, .partitionLive: .partition
+            }
+        }
+
+        static func first(for mode: AppMode) -> TutorialStep {
+            switch mode {
+            case .basic: .placeTriangle
+            case .paths: .pathsLoadShape
+            case .regions: .regionsLoadShape
+            case .partition: .partitionRun
+            }
+        }
+
+        /// The next step within the same flow; nil at the flow's end.
+        var next: TutorialStep? {
+            guard let candidate = TutorialStep(rawValue: rawValue + 1),
+                  candidate.flow == flow else { return nil }
+            return candidate
+        }
+
+        var indexInFlow: Int { rawValue - Self.first(for: flow).rawValue }
+        var flowLength: Int { Self.allCases.filter { $0.flow == flow }.count }
+
+        /// The step's instruction; result-dependent steps read the current
+        /// membership verdict so the text matches what's on screen.
+        func instruction(inside: Bool?) -> String {
+            switch self {
+            case .placeTriangle:
+                "Tap three spots on the canvas. They become S — the corner points of a triangle."
+            case .dragTarget:
+                "The round dot is the target p. Drag it anywhere — the algorithm will test whether p lies inside the triangle."
+            case .runIt:
+                "The small square is the starting iterate. The algorithm will walk it toward p, one pivot at a time. Press Run."
+            case .watchTrace:
+                "Watch each step: the ring marks the pivot — a corner at least as far from the iterate as from p — and the iterate slides along the dashed direction to the spot nearest p."
+            case .readResult:
+                inside == false
+                    ? "The iterate stopped at a ✕ — a witness. No valid pivot was left, which proves p is outside the triangle; the red dot up top says the same."
+                    : "The iterate reached p, so p is inside the triangle — the green dot up top confirms it."
+            case .tryOtherSide:
+                inside == false
+                    ? "Now drag p inside the triangle and press Run again — this time the iterate should reach it."
+                    : "Now drag p outside the triangle and press Run again — with no valid pivot left, the iterate stops as a ✕ witness."
+            case .explore:
+                "That's the whole algorithm! Explore the modes up top: Paths traces many starts at once, Regions paints the areas between paths, and Partition colors the hull by each point's first pivot. Each has its own tutorial under the ⋯ menu."
+            case .pathsLoadShape:
+                "Paths traces a whole set of starting iterates at once. Load a point set from the shape menu below — Circle is a good start — or tap points by hand and press Run."
+            case .pathsWatch:
+                "Every small square is a starting iterate. They all walk toward p at the same time, each picking its own pivots along the way."
+            case .pathsSchemes:
+                "Each path either reached p or stopped at a ✕ witness. The grid button at the top left lays the starts out differently — Border, Corners, Points of S, Ring, Spiral, or your own custom set. Pick one and Run again."
+            case .pathsLive:
+                "Everything is live: drag p or any point of S and the paths re-trace as you move. Next stop: the Regions tutorial, under the ⋯ menu."
+            case .regionsLoadShape:
+                "Regions turns the paths into a painting: the area between neighboring paths fills with the palette's colors. Load a shape from the menu below — Star makes a good one."
+            case .regionsWatch:
+                "As each pair of neighboring paths sweeps in, the wedge between them fills with a color from the theme."
+            case .regionsPaint:
+                "Now paint by hand: tap the paintbrush at the top left, pick a color from the wheel, then tap any wedge to recolor it."
+            case .regionsThemes:
+                "Nice! Themes, a custom palette, and the Iteration-intensity coloring live under ⋯ → Settings, and the share button exports the picture as a poster. Last stop: the Partition tutorial, under ⋯."
+            case .partitionRun:
+                "Partition answers one question: from each point inside the hull, which vertex does the algorithm pivot on first? Load a shape from the menu below or tap your own points, then press Run."
+            case .partitionRead:
+                "Each color is one vertex's territory: every point in a region makes its first pivot at the vertex wearing that color."
+            case .partitionLive:
+                "Drag p and watch the territories reshape around it. That's the full tour — replay any tutorial from the ⋯ menu."
             }
         }
     }
@@ -264,6 +442,7 @@ struct ContentView: View {
         }
     }
 
+    @AppStorage("appMode") private var mode: AppMode = .basic
     @State private var hullPoints: [CGPoint] = []
     @State private var queryPoint: CGPoint? = nil
 
@@ -279,6 +458,11 @@ struct ContentView: View {
     @State private var dragResolved = false
     @State private var showInfo = false
     @State private var showHelp = false
+    @State private var tutorialStep: TutorialStep? = nil
+    /// The verdict of the run the tutorial is narrating, captured when the
+    /// trace finishes so the step text doesn't flip while the user drags
+    /// p around for the next step.
+    @State private var tutorialVerdict: Bool? = nil
     @AppStorage("hasSeenHelpOverlay") private var hasSeenHelpOverlay = false
     @State private var palette: Palette = .mondrian
     @State private var showPaletteEditor = false
@@ -289,6 +473,8 @@ struct ContentView: View {
     @State private var fieldTask: Task<Void, Never>? = nil
     @State private var isBuildingField = false
     @State private var fieldProgress: Double = 0
+    @State private var partitionField: PartitionField? = nil
+    @State private var partitionImage: CGImage? = nil
     @State private var iterateScheme: IterateScheme = .border
     @AppStorage("iterateCount") private var iterateCount = 8
     @AppStorage("trajectoryLineWidth") private var trajectoryLineWidth = 4.0
@@ -317,13 +503,18 @@ struct ContentView: View {
     @State private var showSaveFailedAlert = false
     @State private var soundEngine = SoundEngine()
 
-    private let stepsPerSecond: Double = 7
+    /// Basic mode traces slowly enough to follow each pivot; the other
+    /// modes favor a lively composition.
+    private var stepsPerSecond: Double { mode == .basic ? 1.6 : 7 }
     private let grabRadius: CGFloat = 30
 
     private var hasRun: Bool { !trajectories.isEmpty }
 
+    /// Whether the current mode has a finished picture worth exporting.
+    private var hasResult: Bool { mode == .partition ? partitionField != nil : hasRun }
+
     private var membershipResult: Bool? {
-        guard hasRun else { return nil }
+        guard hasRun, mode != .partition else { return nil }
         // A single witness proves non-membership; otherwise all trajectories converged.
         return trajectories.allSatisfy(\.converged)
     }
@@ -332,7 +523,7 @@ struct ContentView: View {
         ZStack {
             canvas
 
-            if hullPoints.isEmpty && !isAmbient && !isEditingIterates {
+            if hullPoints.isEmpty && !isAmbient && !isEditingIterates && tutorialStep == nil {
                 emptyStateHint
             }
 
@@ -343,6 +534,9 @@ struct ContentView: View {
                 VStack(spacing: 12) {
                     topOverlay
                     Spacer()
+                    if let step = tutorialStep {
+                        tutorialCard(step)
+                    }
                     controlBar
                 }
                 .padding()
@@ -350,16 +544,21 @@ struct ContentView: View {
             }
 
             if showHelp {
-                HelpOverlay {
+                HelpOverlay(dismiss: {
                     hasSeenHelpOverlay = true
                     showHelp = false
-                }
+                }, startTutorial: {
+                    startTutorial()
+                })
                 .transition(.opacity)
                 .zIndex(1)
             }
         }
         .onAppear {
             if !hasSeenHelpOverlay { showHelp = true }
+            // The mode persists across launches but the scheme doesn't:
+            // restore the Regions default when launching straight into it.
+            if mode == .regions { iterateScheme = .pointsOfS }
         }
         .animation(.easeInOut(duration: 0.25), value: showHelp)
         .animation(.easeInOut(duration: 0.3), value: isAmbient)
@@ -397,6 +596,46 @@ struct ContentView: View {
         .onChange(of: soundOn) { _, isOn in
             if !isOn { soundEngine.stop() }
         }
+        .onChange(of: isAnimating) { _, animating in
+            // The tutorials follow the user's own runs: starting a trace
+            // moves to the commentary step, a finished trace moves on to
+            // reading the result.
+            guard let step = tutorialStep else { return }
+            let advanced: TutorialStep?
+            if animating {
+                switch step {
+                case .dragTarget, .runIt: advanced = .watchTrace
+                case .pathsLoadShape: advanced = .pathsWatch
+                case .regionsLoadShape: advanced = .regionsWatch
+                default: advanced = nil
+                }
+            } else {
+                switch step {
+                case .watchTrace:
+                    tutorialVerdict = membershipResult
+                    advanced = .readResult
+                case .tryOtherSide where hasRun: advanced = .explore
+                case .pathsWatch: advanced = .pathsSchemes
+                case .regionsWatch: advanced = .regionsPaint
+                default: advanced = nil
+                }
+            }
+            if let advanced {
+                withAnimation(.spring(duration: 0.35)) { tutorialStep = advanced }
+            }
+        }
+        .onChange(of: isBuildingField) { _, building in
+            // Partition tutorial: move on once the first partition renders.
+            if !building, tutorialStep == .partitionRun, partitionField != nil {
+                withAnimation(.spring(duration: 0.35)) { tutorialStep = .partitionRead }
+            }
+        }
+        .onChange(of: wedgeOverrides) { _, overrides in
+            // Regions tutorial: painting the first wedge completes the step.
+            if !overrides.isEmpty, tutorialStep == .regionsPaint {
+                withAnimation(.spring(duration: 0.35)) { tutorialStep = .regionsThemes }
+            }
+        }
         .onChange(of: coloringMode) { _, newMode in
             if newMode == .intensity {
                 // The plot doesn't use the iterate set or the wedge fills;
@@ -410,20 +649,65 @@ struct ContentView: View {
             rebuildIterationField()
         }
         .onChange(of: palette) { _, newPalette in
-            // The field's data survives a theme change; only re-tint the bitmap.
+            // The fields' data survives a theme change; only re-tint the bitmaps.
             if let field = iterationField {
                 fieldImage = field.makeImage(baseColor: UIColor(newPalette.intensityBase))
             }
+            if let field = partitionField {
+                partitionImage = field.makeImage(colors: partitionColors(for: newPalette))
+            }
+        }
+        .onChange(of: mode) { _, newMode in
+            // A tutorial narrates one specific mode; switching away from
+            // it mid-flow ends the walkthrough.
+            if let step = tutorialStep, step.flow != newMode {
+                tutorialStep = nil
+            }
+            // A mode switch keeps the placed points but clears the finished
+            // picture — each tier composes its own kind of result.
+            trajectories = []
+            runStart = nil
+            isAnimating = false
+            soundEngine.stop()
+            cancelFieldBuild()
+            iterationField = nil
+            fieldImage = nil
+            partitionField = nil
+            partitionImage = nil
+            isEditingIterates = false
+            isPaintingWedges = false
+            if newMode == .basic {
+                // Basic works on a single triangle: keep three well-spread
+                // hull vertices when arriving from a many-point set.
+                let hull = convexHull(of: hullPoints)
+                if hullPoints.count > 3 && hull.count >= 3 {
+                    hullPoints = [hull[0], hull[hull.count / 3], hull[2 * hull.count / 3]]
+                }
+                startPoints = Array(startPoints.prefix(1))
+            }
+            // Each tier opens with its own default iterate layout; a
+            // hand-placed custom set is the user's own and stays.
+            if iterateScheme != .custom {
+                switch newMode {
+                case .paths: iterateScheme = .border
+                case .regions: iterateScheme = .pointsOfS
+                case .basic, .partition: break
+                }
+            }
+            syncIteratesToHull()
         }
         .onChange(of: iterateScheme) { _, newScheme in
-            guard let points = newScheme.points(inHull: convexHull(of: hullPoints), count: iterateCount) else { return }
+            guard mode != .basic,
+                  let points = newScheme.points(inHull: convexHull(of: hullPoints), vertices: hullPoints, count: iterateCount) else { return }
             startPoints = points
             if hasRun { recompute(animated: false) }
         }
         .onChange(of: iterateCount) { _, newCount in
             // Regenerate the current scheme at the new size; custom sets
-            // are the user's own and stay untouched.
-            guard let points = iterateScheme.points(inHull: convexHull(of: hullPoints), count: newCount) else { return }
+            // are the user's own and stay untouched, as is basic mode's
+            // single start.
+            guard mode != .basic,
+                  let points = iterateScheme.points(inHull: convexHull(of: hullPoints), vertices: hullPoints, count: newCount) else { return }
             startPoints = points
             if hasRun { recompute(animated: false) }
         }
@@ -499,7 +783,7 @@ struct ContentView: View {
                 } header: {
                     Text("Auto-generated iterates")
                 } footer: {
-                    Text("How many starting iterates the schemes generate. Corners uses fewer when the hull has fewer vertices.")
+                    Text("How many starting iterates the schemes generate. Corners uses fewer when the hull has fewer vertices; Points of S ignores this and starts from every point of S.")
                 }
             }
             .navigationTitle("Settings")
@@ -541,9 +825,13 @@ struct ContentView: View {
         VStack(spacing: 10) {
             Image(systemName: "hand.tap")
                 .font(.system(size: 44))
-            Text("Tap anywhere to add hull points")
+            Text(mode == .basic
+                 ? "Tap 3 points to make the triangle S"
+                 : "Tap anywhere to add points of S")
                 .font(.headline)
-            Text("Drag the target dot to move it, then press Run")
+            Text(mode == .basic
+                 ? "Then drag the target p and the start square, and press Run"
+                 : "Drag the target dot to move it, then press Run")
                 .font(.subheadline)
         }
         .foregroundStyle(.secondary)
@@ -568,13 +856,15 @@ struct ContentView: View {
 
     private var topOverlay: some View {
         VStack(spacing: 10) {
+            modePicker
             HStack(alignment: .top, spacing: 10) {
-                // The intensity plot ignores the iterate set, so editing
-                // controls only appear in palette mode.
-                if coloringMode == .palette {
+                // The iterate set only matters where many paths are traced:
+                // basic has a single fixed start, partition ignores starts,
+                // and the intensity plot samples its own grid.
+                if mode == .paths || (mode == .regions && coloringMode == .palette) {
                     iterateMenu
                 }
-                if coloringMode == .palette && hasRun {
+                if mode == .regions && coloringMode == .palette && hasRun {
                     paintButton
                 }
                 Spacer()
@@ -596,11 +886,25 @@ struct ContentView: View {
         .animation(.spring(duration: 0.3), value: coloringMode)
     }
 
+    /// The feature tiers, from the single demonstrated path to the full
+    /// canvas. Switching keeps the points but clears the finished picture.
+    private var modePicker: some View {
+        Picker("Mode", selection: $mode) {
+            ForEach(AppMode.allCases) { mode in
+                Text(mode.rawValue).tag(mode)
+            }
+        }
+        .pickerStyle(.segmented)
+        .frame(maxWidth: 420)
+        .padding(4)
+        .glassEffect(in: .rect(cornerRadius: 12))
+    }
+
     private var fieldProgressChip: some View {
         HStack(spacing: 10) {
             ProgressView(value: fieldProgress)
                 .frame(width: 90)
-            Text("Intensity \(Int(fieldProgress * 100))%")
+            Text("\(mode == .partition ? "Partition" : "Intensity") \(Int(fieldProgress * 100))%")
                 .monospacedDigit()
             Button("Stop") {
                 cancelFieldBuild()
@@ -688,7 +992,7 @@ struct ContentView: View {
                          : .regular)
         } else if isAnimating {
             HStack(spacing: 12) {
-                Label("Tracing \(trajectories.count) trajectories…", systemImage: "point.bottomleft.forward.to.point.topright.scurvepath")
+                Label("Tracing \(trajectories.count) trajector\(trajectories.count == 1 ? "y" : "ies")…", systemImage: "point.bottomleft.forward.to.point.topright.scurvepath")
                 Button("Stop") {
                     stopTrace()
                 }
@@ -699,9 +1003,7 @@ struct ContentView: View {
             .padding(.vertical, 8)
             .glassEffect()
         } else if !hullPoints.isEmpty {
-            Text(hullPoints.count < 3
-                 ? "\(hullPoints.count) point\(hullPoints.count == 1 ? "" : "s") — add at least 3"
-                 : "\(hullPoints.count) points — press Run")
+            Text(pointCountStatus)
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 14)
@@ -710,12 +1012,27 @@ struct ContentView: View {
         }
     }
 
+    private var pointCountStatus: String {
+        if mode == .basic {
+            return hullPoints.count < 3
+                ? "\(hullPoints.count) of 3 triangle points"
+                : "Triangle ready — drag the corners, target, or start square, then Run"
+        }
+        if mode == .partition && partitionField != nil {
+            return "\(hullPoints.count) points — drag the target to reshape the partition"
+        }
+        return hullPoints.count < 3
+            ? "\(hullPoints.count) point\(hullPoints.count == 1 ? "" : "s") — add at least 3"
+            : "\(hullPoints.count) points — press Run"
+    }
+
     private var iterateMenu: some View {
         Menu {
             Picker("Iterates", selection: $iterateScheme) {
                 Section("Deterministic") {
                     Text(IterateScheme.border.name).tag(IterateScheme.border)
                     Text(IterateScheme.corners.name).tag(IterateScheme.corners)
+                    Text(IterateScheme.pointsOfS.name).tag(IterateScheme.pointsOfS)
                 }
                 Section("Patterned") {
                     Text(IterateScheme.ring.name).tag(IterateScheme.ring)
@@ -761,7 +1078,7 @@ struct ContentView: View {
             }
         }
         .buttonStyle(.glass)
-        .disabled(!hasRun || isAnimating || isRenderingPoster)
+        .disabled(!hasResult || isAnimating || isRenderingPoster)
         .accessibilityLabel(isRenderingPoster ? "Rendering poster" : "Export poster")
     }
 
@@ -827,7 +1144,67 @@ struct ContentView: View {
         .font(.footnote)
     }
 
+    // MARK: Tutorial
+
+    /// Switches to the chosen mode on a blank canvas and begins that
+    /// mode's walkthrough.
+    private func startTutorial(for flowMode: AppMode = .basic) {
+        showHelp = false
+        hasSeenHelpOverlay = true
+        showSettings = false
+        isAmbient = false
+        mode = flowMode
+        clearAll()
+        withAnimation(.spring(duration: 0.35)) { tutorialStep = .first(for: flowMode) }
+    }
+
+    /// One step of the walkthrough, pinned above the control bar so the
+    /// canvas stays fully visible and interactive.
+    private func tutorialCard(_ step: TutorialStep) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("\(step.flow.rawValue) tutorial", systemImage: "graduationcap.fill")
+                    .font(.caption.bold())
+                Spacer()
+                Text("\(step.indexInFlow + 1) of \(step.flowLength)")
+                    .font(.caption)
+                    .monospacedDigit()
+            }
+            .foregroundStyle(.secondary)
+            Text(step.instruction(inside: tutorialVerdict))
+                .font(.subheadline)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Button("End tutorial") {
+                    withAnimation(.spring(duration: 0.35)) { tutorialStep = nil }
+                }
+                Spacer()
+                Button(step.next == nil ? "Done" : "Next") {
+                    withAnimation(.spring(duration: 0.35)) { tutorialStep = step.next }
+                }
+                .font(.subheadline.bold())
+            }
+            .font(.subheadline)
+        }
+        .padding(16)
+        .frame(maxWidth: 460)
+        .glassEffect(in: .rect(cornerRadius: 20))
+        .transition(.move(edge: .bottom).combined(with: .opacity))
+    }
+
     // MARK: Control bar
+
+    private var runDisabled: Bool {
+        guard !isAnimating, queryPoint != nil else { return true }
+        switch mode {
+        case .basic:
+            return hullPoints.count < 3 || startPoints.isEmpty
+        case .paths, .regions:
+            return hullPoints.isEmpty || startPoints.isEmpty
+        case .partition:
+            return convexHull(of: hullPoints).count < 3
+        }
+    }
 
     private var controlBar: some View {
         GlassEffectContainer(spacing: 14) {
@@ -835,13 +1212,17 @@ struct ContentView: View {
                 Button {
                     recompute(animated: true)
                 } label: {
-                    Label(hasRun ? "Replay" : "Run", systemImage: hasRun ? "arrow.clockwise" : "play.fill")
+                    Label(hasResult ? "Replay" : "Run", systemImage: hasResult ? "arrow.clockwise" : "play.fill")
                         .frame(minWidth: 90)
                 }
                 .buttonStyle(.glassProminent)
-                .disabled(hullPoints.isEmpty || queryPoint == nil || startPoints.isEmpty || isAnimating)
+                .disabled(runDisabled)
 
-                shapeMenu
+                // Basic mode is the hand-placed triangle; the sampled shapes
+                // belong to the richer tiers.
+                if mode != .basic {
+                    shapeMenu
+                }
 
                 Button(action: undo) {
                     Image(systemName: "arrow.uturn.backward")
@@ -882,11 +1263,23 @@ struct ContentView: View {
     private var moreMenu: some View {
         Menu {
             Button {
+                // Ambient takes over the whole canvas; a tutorial in
+                // progress can't continue underneath it.
+                tutorialStep = nil
                 isAmbient = true
             } label: {
                 Label("Ambient mode", systemImage: "sparkles")
             }
             Divider()
+            Menu {
+                ForEach(AppMode.allCases) { flowMode in
+                    Button(flowMode.rawValue) {
+                        startTutorial(for: flowMode)
+                    }
+                }
+            } label: {
+                Label("Tutorials", systemImage: "graduationcap")
+            }
             Button {
                 showSettings = true
             } label: {
@@ -951,10 +1344,16 @@ struct ContentView: View {
                 startPoints.append(location)
                 iterateScheme = .custom
             } else {
+                // Basic mode is exactly one triangle; extra taps do nothing
+                // (the status chip explains the corners are draggable).
+                guard mode != .basic || hullPoints.count < 3 else { return }
                 hullPoints.append(location)
                 syncIteratesToHull()
+                if tutorialStep == .placeTriangle && convexHull(of: hullPoints).count >= 3 {
+                    withAnimation(.spring(duration: 0.35)) { tutorialStep = .dragTarget }
+                }
             }
-            if hasRun { recompute(animated: false) }
+            if hasResult { recompute(animated: false) }
         }
         .gesture(pointDragGesture)
         .ignoresSafeArea(edges: .bottom)
@@ -981,14 +1380,28 @@ struct ContentView: View {
                 default:
                     break
                 }
-                if hasRun { recompute(animated: false) }
+                if tutorialStep == .tryOtherSide {
+                    // The teaching moment here is pressing Run and watching
+                    // the outcome; live-recomputing during the drag would
+                    // reveal the answer early. Clear the old run instead.
+                    trajectories = []
+                    runStart = nil
+                } else if hasResult {
+                    recompute(animated: false)
+                }
             }
             .onEnded { _ in
                 let wasDragging = activeDrag != nil
+                if tutorialStep == .dragTarget && activeDrag == .query {
+                    withAnimation(.spring(duration: 0.35)) { tutorialStep = .runIt }
+                }
                 activeDrag = nil
                 dragResolved = false
-                // Refine the coarse drag-time field back to full resolution.
-                if wasDragging && hasRun && coloringMode == .intensity {
+                // Refine the coarse drag-time fields back to full resolution.
+                guard wasDragging else { return }
+                if mode == .partition, partitionField != nil {
+                    rebuildPartition()
+                } else if hasRun && mode == .regions && coloringMode == .intensity {
                     rebuildIterationField()
                 }
             }
@@ -1007,9 +1420,10 @@ struct ContentView: View {
                 best = (.hull(index), gap)
             }
         }
-        // Start points only participate while the user is editing iterates,
-        // so the border squares never hijack hull or target drags.
-        if isEditingIterates {
+        // Start points only participate while the user is editing iterates —
+        // so the border squares never hijack hull or target drags — except
+        // in basic mode, where the single start square is always live.
+        if isEditingIterates || mode == .basic {
             for (index, point) in startPoints.enumerated() {
                 let gap = distance(point, location)
                 if gap <= grabRadius && gap < (best?.gap ?? .greatestFiniteMagnitude) {
@@ -1033,13 +1447,25 @@ struct ContentView: View {
             startPoints = []
             return
         }
+        if mode == .basic {
+            // A single start iterate, defaulting to the triangle's centroid;
+            // the user drags it anywhere inside.
+            if let existing = startPoints.first {
+                startPoints = [clampToConvexHull(existing, hull: hull)]
+            } else {
+                let centroid = CGPoint(x: hull.map(\.x).reduce(0, +) / CGFloat(hull.count),
+                                       y: hull.map(\.y).reduce(0, +) / CGFloat(hull.count))
+                startPoints = [centroid]
+            }
+            return
+        }
         if iterateScheme == .custom || iterateScheme.isRandom {
-            if startPoints.isEmpty, let generated = iterateScheme.points(inHull: hull, count: iterateCount) {
+            if startPoints.isEmpty, let generated = iterateScheme.points(inHull: hull, vertices: hullPoints, count: iterateCount) {
                 startPoints = generated
             } else {
                 startPoints = startPoints.map { clampToConvexHull($0, hull: hull) }
             }
-        } else if let generated = iterateScheme.points(inHull: hull, count: iterateCount) {
+        } else if let generated = iterateScheme.points(inHull: hull, vertices: hullPoints, count: iterateCount) {
             startPoints = generated
         }
     }
@@ -1060,7 +1486,7 @@ struct ContentView: View {
     private func rebuildIterationField(coarse: Bool = false) {
         fieldTask?.cancel()
         let hull = convexHull(of: hullPoints)
-        guard coloringMode == .intensity, hasRun,
+        guard mode == .regions, coloringMode == .intensity, hasRun,
               let p = queryPoint, hull.count >= 3, canvasSize != .zero else {
             iterationField = nil
             fieldImage = nil
@@ -1120,19 +1546,107 @@ struct ContentView: View {
         isBuildingField = false
     }
 
+    /// The region colors for partition mode, one per hull vertex (cycled):
+    /// accents first so neighboring regions read as distinct.
+    private func partitionSliceColors(for palette: Palette) -> [Color] {
+        let accents = palette.slices.filter { !$0.isNeutral }.map(\.color)
+        let neutrals = palette.slices.filter(\.isNeutral).map(\.color)
+        return accents + neutrals
+    }
+
+    private func partitionColors(for palette: Palette) -> [UIColor] {
+        partitionSliceColors(for: palette).map(UIColor.init)
+    }
+
+    /// Samples the hull's interior and records which vertex the algorithm
+    /// pivots on first from each cell, coloring the hull into the pivot's
+    /// partition regions.
+    ///
+    /// Runs in the same cancellable background pipeline as the intensity
+    /// field; `coarse` gives quick low-resolution feedback during drags.
+    private func rebuildPartition(coarse: Bool = false) {
+        fieldTask?.cancel()
+        let hull = convexHull(of: hullPoints)
+        guard mode == .partition, let p = queryPoint,
+              hull.count >= 3, canvasSize != .zero else {
+            partitionField = nil
+            partitionImage = nil
+            isBuildingField = false
+            return
+        }
+        let vertices = hullPoints
+        // Partition sampling is one iteration per cell, far cheaper than the
+        // intensity field's full traces, so it affords a much denser grid —
+        // fine enough that the region boundaries read as smooth curves.
+        let cellSize: CGFloat = coarse ? 8 : 1.5
+        let columns = Int(ceil(canvasSize.width / cellSize))
+        let rows = Int(ceil(canvasSize.height / cellSize))
+        guard columns > 0, rows > 0 else {
+            partitionField = nil
+            partitionImage = nil
+            isBuildingField = false
+            return
+        }
+        let colors = partitionColors(for: palette)
+        isBuildingField = !coarse
+        fieldProgress = 0
+        fieldTask = Task.detached(priority: .userInitiated) {
+            var pivots = [Int](repeating: -1, count: columns * rows)
+            let batchRows = 24
+            for batchStart in stride(from: 0, to: rows, by: batchRows) {
+                let batchEnd = min(batchStart + batchRows, rows)
+                for row in batchStart..<batchEnd {
+                    if Task.isCancelled { return }
+                    for column in 0..<columns {
+                        let start = CGPoint(x: (CGFloat(column) + 0.5) * cellSize,
+                                            y: (CGFloat(row) + 0.5) * cellSize)
+                        guard isInsideConvexHull(start, hull: hull),
+                              let step = TriangleAlgorithm.step(from: start, vertices: vertices, target: p)
+                        else { continue }
+                        pivots[row * columns + column] = step.pivotIndex
+                    }
+                }
+                if Task.isCancelled { return }
+                let partial = PartitionField(cellSize: cellSize, columns: columns,
+                                             rows: rows, pivotIndices: pivots)
+                let progress = Double(batchEnd) / Double(rows)
+                await MainActor.run {
+                    partitionField = partial
+                    partitionImage = partial.makeImage(colors: colors)
+                    if !coarse {
+                        fieldProgress = progress
+                        if batchEnd == rows { isBuildingField = false }
+                    }
+                }
+            }
+        }
+    }
+
+
+
     private func recompute(animated: Bool) {
         guard let p = queryPoint, !hullPoints.isEmpty, canvasSize != .zero else { return }
+        // Partition mode has no trajectories: Run builds the first-pivot
+        // field and the one-step arrows instead.
+        if mode == .partition {
+            rebuildPartition(coarse: activeDrag != nil)
+            runStart = nil
+            isAnimating = false
+            soundEngine.stop()
+            return
+        }
         // A random scheme samples a fresh set on every animated run, so each
-        // Run/Replay composes a new picture.
-        if animated, iterateScheme.isRandom,
-           let fresh = iterateScheme.points(inHull: convexHull(of: hullPoints), count: iterateCount),
+        // Run/Replay composes a new picture. Basic mode's single start stays
+        // where the user put it.
+        if animated, mode != .basic, iterateScheme.isRandom,
+           let fresh = iterateScheme.points(inHull: convexHull(of: hullPoints), vertices: hullPoints, count: iterateCount),
            !fresh.isEmpty {
             startPoints = fresh
         }
         guard !startPoints.isEmpty else { return }
         trajectories = startPoints.map { start in
             let result = TriangleAlgorithm.trace(from: start, vertices: hullPoints, target: p)
-            return Trajectory(points: result.points, converged: result.converged)
+            return Trajectory(points: result.points, pivots: result.pivots, converged: result.converged)
         }
         rebuildIterationField(coarse: activeDrag != nil)
         if animated {
@@ -1215,6 +1729,8 @@ struct ContentView: View {
         cancelFieldBuild()
         iterationField = nil
         fieldImage = nil
+        partitionField = nil
+        partitionImage = nil
         soundEngine.stop()
         if canvasSize != .zero {
             queryPoint = CGPoint(x: canvasSize.width / 2, y: canvasSize.height / 2)
@@ -1225,7 +1741,7 @@ struct ContentView: View {
         guard canvasSize != .zero else { return }
         let w = canvasSize.width
         let h = canvasSize.height
-        hullPoints = (0..<Int.random(in: 5...8)).map { _ in
+        hullPoints = (0..<(mode == .basic ? 3 : Int.random(in: 5...8))).map { _ in
             CGPoint(
                 x: CGFloat.random(in: 0.15 * w...0.85 * w),
                 y: CGFloat.random(in: 0.2 * h...0.72 * h)
@@ -1254,10 +1770,54 @@ struct ContentView: View {
         let maxRadiusX = 0.35 * canvasSize.width
         let maxRadiusY = 0.26 * canvasSize.height
 
-        // Roughly one point per 18 points of perimeter — enough that the
-        // largest gap between neighbors stays visually smooth.
+        // A deliberately small vertex set — 10 to 20 points — so each dot of
+        // S stays individually readable instead of dissolving into an outline.
         func sampleCount(forPerimeter perimeter: CGFloat) -> Int {
-            max(24, min(64, Int(perimeter / 18)))
+            max(10, min(20, Int(perimeter / 60)))
+        }
+
+        /// The shape's own corners pinned exactly, with whatever remains of
+        /// the point budget scattered stratified along the outline's edges.
+        /// Everything comes back in perimeter order — downstream features
+        /// like the Points of S iterates and the wedge fills between
+        /// consecutive trajectories rely on neighbors in the array being
+        /// neighbors on the outline.
+        func sampledOutline(_ corners: [CGPoint]) -> [CGPoint] {
+            let edges = corners.indices.map { (start: corners[$0], end: corners[($0 + 1) % corners.count]) }
+            let lengths = edges.map { distance($0.start, $0.end) }
+            let perimeter = lengths.reduce(0, +)
+            let extra = max(0, sampleCount(forPerimeter: perimeter) - corners.count)
+            guard extra > 0, perimeter > 0 else { return corners }
+            // Arc-length position of every point, corner and extra alike.
+            var positioned: [(position: CGFloat, point: CGPoint)] = []
+            var walked: CGFloat = 0
+            for (index, corner) in corners.enumerated() {
+                positioned.append((walked, corner))
+                walked += lengths[index]
+            }
+            for i in 0..<extra {
+                let position = perimeter * (CGFloat(i) + .random(in: 0..<1)) / CGFloat(extra)
+                var remaining = position
+                for (index, edge) in edges.enumerated() where lengths[index] > 0 {
+                    if remaining <= lengths[index] {
+                        let t = remaining / lengths[index]
+                        positioned.append((position, CGPoint(x: edge.start.x + (edge.end.x - edge.start.x) * t,
+                                                             y: edge.start.y + (edge.end.y - edge.start.y) * t)))
+                        break
+                    }
+                    remaining -= lengths[index]
+                }
+            }
+            return positioned.sorted { $0.position < $1.position }.map(\.point)
+        }
+
+        func regularPolygon(sides: Int) -> [CGPoint] {
+            let radius = min(maxRadiusX, maxRadiusY)
+            return (0..<sides).map { i in
+                let angle = -CGFloat.pi / 2 + CGFloat(i) * 2 * .pi / CGFloat(sides)
+                return CGPoint(x: center.x + radius * cos(angle),
+                               y: center.y + radius * sin(angle))
+            }
         }
 
         let points: [CGPoint]
@@ -1282,29 +1842,31 @@ struct ContentView: View {
             }
         case .square:
             let half = min(maxRadiusX, maxRadiusY)
-            let rect = CGRect(x: center.x - half, y: center.y - half,
-                              width: half * 2, height: half * 2)
-            let side = half * 2
-            // The corners pin the true outline; the stratified edge points
-            // fill in the rest of the vertex set.
-            let corners = [CGPoint(x: rect.minX, y: rect.minY),
-                           CGPoint(x: rect.maxX, y: rect.minY),
-                           CGPoint(x: rect.maxX, y: rect.maxY),
-                           CGPoint(x: rect.minX, y: rect.maxY)]
-            let count = sampleCount(forPerimeter: 4 * side)
-            let edgePoints = (0..<count).map { i -> CGPoint in
-                let t = (CGFloat(i) + .random(in: 0..<1)) * 4 * side / CGFloat(count)
-                if t < side {
-                    return CGPoint(x: rect.minX + t, y: rect.minY)
-                } else if t < 2 * side {
-                    return CGPoint(x: rect.maxX, y: rect.minY + t - side)
-                } else if t < 3 * side {
-                    return CGPoint(x: rect.maxX - (t - 2 * side), y: rect.maxY)
-                } else {
-                    return CGPoint(x: rect.minX, y: rect.maxY - (t - 3 * side))
-                }
-            }
-            points = corners + edgePoints
+            points = sampledOutline([CGPoint(x: center.x - half, y: center.y - half),
+                                     CGPoint(x: center.x + half, y: center.y - half),
+                                     CGPoint(x: center.x + half, y: center.y + half),
+                                     CGPoint(x: center.x - half, y: center.y + half)])
+        case .diamond:
+            points = sampledOutline([CGPoint(x: center.x, y: center.y - maxRadiusY),
+                                     CGPoint(x: center.x + maxRadiusX, y: center.y),
+                                     CGPoint(x: center.x, y: center.y + maxRadiusY),
+                                     CGPoint(x: center.x - maxRadiusX, y: center.y)])
+        case .pentagon:
+            points = sampledOutline(regularPolygon(sides: 5))
+        case .hexagon:
+            points = sampledOutline(regularPolygon(sides: 6))
+        case .star:
+            // A five-pointed star, alternating outer and inner corners.
+            // The five inner corners are points of S that lie strictly
+            // inside the convex hull — S itself is not convex.
+            let outer = min(maxRadiusX, maxRadiusY)
+            let inner = outer * 0.45
+            points = sampledOutline((0..<10).map { i in
+                let radius = i.isMultiple(of: 2) ? outer : inner
+                let angle = -CGFloat.pi / 2 + CGFloat(i) * .pi / 5
+                return CGPoint(x: center.x + radius * cos(angle),
+                               y: center.y + radius * sin(angle))
+            })
         }
 
         hullPoints = points
@@ -1315,7 +1877,7 @@ struct ContentView: View {
     // MARK: Poster export
 
     private func sharePoster() {
-        guard hasRun, !isAnimating, canvasSize != .zero, !isRenderingPoster else { return }
+        guard hasResult, !isAnimating, canvasSize != .zero, !isRenderingPoster else { return }
         isRenderingPoster = true
         Task { @MainActor in
             // ImageRenderer is main-actor bound, so the rasterization itself
@@ -1336,6 +1898,11 @@ struct ContentView: View {
         }
     }
 
+    private var posterCaption: String {
+        if mode == .partition { return "first-pivot partition" }
+        return membershipResult == true ? "inside the hull" : "witness found"
+    }
+
     /// The finished composition matted and captioned like a gallery print.
     private var posterContent: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -1349,7 +1916,7 @@ struct ContentView: View {
                 Text("TriangleTrace")
                     .font(.system(.headline, design: .serif))
                 Spacer()
-                Text("\(palette.name) · \(membershipResult == true ? "inside the hull" : "witness found")")
+                Text("\(palette.name) · \(posterCaption)")
                     .font(.system(.caption, design: .serif))
                     .opacity(0.7)
             }
@@ -1462,29 +2029,102 @@ struct ContentView: View {
         } else {
             progress = .infinity
         }
-        switch coloringMode {
-        case .palette:
-            drawMondrianRegions(in: &context, size: size, upTo: progress)
-        case .intensity:
-            drawIterationField(in: &context, size: size)
+        switch mode {
+        case .regions:
+            switch coloringMode {
+            case .palette:
+                drawMondrianRegions(in: &context, size: size, upTo: progress)
+            case .intensity:
+                drawIterationField(in: &context, size: size)
+            }
+        case .partition:
+            drawPartitionField(in: &context)
+        case .basic, .paths:
+            break
         }
         drawHull(in: &context)
-        // The intensity field speaks for itself; trajectory polylines would
-        // just cover it, so they only render in palette mode.
-        if coloringMode == .palette {
+        switch mode {
+        case .basic:
             drawTrajectories(in: &context, upTo: progress)
+            drawPivotDemo(in: &context, upTo: progress)
+        case .paths:
+            drawTrajectories(in: &context, upTo: progress)
+        case .regions:
+            // The intensity field speaks for itself; trajectory polylines
+            // would just cover it, so they only render in palette mode.
+            if coloringMode == .palette {
+                drawTrajectories(in: &context, upTo: progress)
+            }
+        case .partition:
+            // The partition coloring stands alone — no paths on top.
+            break
         }
         drawStartPoints(in: &context)
         drawHullPoints(in: &context)
         drawQueryPoint(in: &context)
     }
 
+    /// Basic mode's pivot demonstration. While the trace animates, a dashed
+    /// line runs from the current iterate to the vertex chosen as pivot,
+    /// with a ring calling the pivot out; once finished, every step's pivot
+    /// line stays faintly visible so the whole run can be read back.
+    private func drawPivotDemo(in context: inout GraphicsContext, upTo progress: Double) {
+        guard let trajectory = trajectories.first, !trajectory.pivots.isEmpty else { return }
+        let points = trajectory.points
+        let pivots = trajectory.pivots
+        if progress >= Double(points.count - 1) {
+            for (index, pivot) in pivots.enumerated() {
+                var line = Path()
+                line.move(to: points[index])
+                line.addLine(to: pivot)
+                context.stroke(line, with: .color(palette.target.opacity(0.3)),
+                               style: StrokeStyle(lineWidth: 1.5, dash: [4, 4]))
+            }
+        } else {
+            let step = min(max(Int(progress), 0), pivots.count - 1)
+            let pivot = pivots[step]
+            var line = Path()
+            line.move(to: points[step])
+            line.addLine(to: pivot)
+            context.stroke(line, with: .color(palette.target.opacity(0.8)),
+                           style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
+            let ringRadius = pointMarkerSize + 7
+            let ring = CGRect(x: pivot.x - ringRadius, y: pivot.y - ringRadius,
+                              width: ringRadius * 2, height: ringRadius * 2)
+            context.stroke(Path(ellipseIn: ring), with: .color(palette.target), lineWidth: 3)
+        }
+    }
+
+    /// The first-pivot partition regions as a bitmap under the hull.
+    private func drawPartitionField(in context: inout GraphicsContext) {
+        guard let field = partitionField, let bitmap = partitionImage else { return }
+        let rect = CGRect(x: 0, y: 0,
+                          width: CGFloat(field.columns) * field.cellSize,
+                          height: CGFloat(field.rows) * field.cellSize)
+        // Nearest-neighbor keeps the region boundaries crisp instead of
+        // blending neighboring regions into false colors.
+        let image = Image(decorative: bitmap, scale: 1).interpolation(.none)
+        context.draw(image, in: rect)
+    }
+
+
     /// Starting iterate markers (squares), visible once a run exists or while
     /// the user is editing the iterate set.
     private func drawStartPoints(in context: inout GraphicsContext) {
-        // In intensity mode the squares belong to the hidden trajectories,
-        // so they only appear while the user is editing the iterate set.
-        guard isEditingIterates || (hasRun && coloringMode == .palette) else { return }
+        switch mode {
+        case .basic:
+            // The single start square is always live and draggable.
+            break
+        case .partition:
+            // Partition mode has no starting iterates at all.
+            return
+        case .paths:
+            guard isEditingIterates || hasRun else { return }
+        case .regions:
+            // In intensity mode the squares belong to the hidden trajectories,
+            // so they only appear while the user is editing the iterate set.
+            guard isEditingIterates || (hasRun && coloringMode == .palette) else { return }
+        }
         for (index, point) in startPoints.enumerated() {
             let base = pointMarkerSize * 0.8
             let half: CGFloat = activeDrag == .start(index) ? base + 3 : base
@@ -1513,12 +2153,16 @@ struct ContentView: View {
     }
 
     private func drawHullPoints(in context: inout GraphicsContext) {
+        // In partition mode each vertex wears its own region's color, so the
+        // coloring reads as a legend.
+        let regionColors = mode == .partition ? partitionSliceColors(for: palette) : []
         for (index, point) in hullPoints.enumerated() {
             let radius: CGFloat = activeDrag == .hull(index) ? pointMarkerSize + 3 : pointMarkerSize
             let rect = CGRect(x: point.x - radius, y: point.y - radius,
                               width: radius * 2, height: radius * 2)
-            context.fill(Path(ellipseIn: rect), with: .color(palette.vertex))
-            context.stroke(Path(ellipseIn: rect), with: .color(palette.background), lineWidth: 2)
+            let fill = regionColors.isEmpty ? palette.vertex : regionColors[index % regionColors.count]
+            context.fill(Path(ellipseIn: rect), with: .color(fill))
+            context.stroke(Path(ellipseIn: rect), with: .color(mode == .partition ? palette.line : palette.background), lineWidth: 2)
         }
     }
 
