@@ -229,13 +229,11 @@ struct PartitionField {
     /// pivot's region filled with its own color.
     func makeImage(colors: [UIColor]) -> CGImage? {
         guard !colors.isEmpty else { return nil }
-        var components: [(r: CGFloat, g: CGFloat, b: CGFloat, a: CGFloat)] = colors.map { color in
+        let components: [(r: CGFloat, g: CGFloat, b: CGFloat, a: CGFloat)] = colors.map { color in
             var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
             color.getRed(&r, green: &g, blue: &b, alpha: &a)
             return (r, g, b, a)
         }
-        // Soften the fills so the hull outline and arrows stay readable.
-        components = components.map { ($0.r, $0.g, $0.b, $0.a * 0.55) }
         var pixels = [UInt8](repeating: 0, count: columns * rows * 4)
         for index in pivotIndices.indices {
             let pivot = pivotIndices[index]
@@ -1913,7 +1911,7 @@ struct ContentView: View {
             .background(palette.background)
 
             HStack(alignment: .firstTextBaseline) {
-                Text("TriangleTrace")
+                Text("Triangle Algorithm")
                     .font(.system(.headline, design: .serif))
                 Spacer()
                 Text("\(palette.name) · \(posterCaption)")
