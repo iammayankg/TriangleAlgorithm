@@ -1575,8 +1575,9 @@ struct ContentView: View {
         let vertices = hullPoints
         // Partition sampling is one iteration per cell, far cheaper than the
         // intensity field's full traces, so it affords a much denser grid —
-        // fine enough that the region boundaries read as smooth curves.
-        let cellSize: CGFloat = coarse ? 8 : 1.5
+        // one sample per 0.75pt puts a cell roughly every two device pixels
+        // on a 3× display, so region boundaries stay crisp curves.
+        let cellSize: CGFloat = coarse ? 8 : 0.75
         let columns = Int(ceil(canvasSize.width / cellSize))
         let rows = Int(ceil(canvasSize.height / cellSize))
         guard columns > 0, rows > 0 else {
