@@ -84,14 +84,24 @@ struct Palette: Identifiable, Hashable {
     var id: String { name }
 }
 
-/// How the regions between trajectories are colored: the palette's fixed
-/// slice colors, or a single hue whose intensity reflects how many
-/// iterations the bounding trajectories needed to converge or find a witness.
+/// How a Paths run is shown: the bare trajectories, the regions between
+/// them filled with the palette's slice colors, or a single hue whose
+/// intensity reflects how many iterations each point of the hull needs.
 enum ColoringMode: String, CaseIterable, Identifiable {
+    case paths = "Plain paths"
     case palette = "Palette slices"
     case intensity = "Iteration intensity"
 
     var id: String { rawValue }
+
+    /// The SF Symbol the coloring button wears for this choice.
+    var symbol: String {
+        switch self {
+        case .paths: "scribble"
+        case .palette: "paintpalette"
+        case .intensity: "circle.lefthalf.filled"
+        }
+    }
 }
 
 extension Palette {
