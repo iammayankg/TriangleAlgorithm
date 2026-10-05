@@ -1,5 +1,4 @@
 import SwiftUI
-import UIKit
 import Photos
 
 @main struct TriangleTraceApp: App {
@@ -90,15 +89,29 @@ nonisolated func clampToConvexHull(_ point: CGPoint, hull: [CGPoint]) -> CGPoint
 
 // MARK: - Triangle Algorithm (Kalantari)
 
+/// How a trace ended. The three cases carry different evidentiary weight:
+/// a convergence proves p is inside the hull, a witness proves it is
+/// outside, and an exhausted run proves nothing either way.
+enum TraceOutcome {
+    /// The iterate got within epsilon of the query point.
+    case converged
+    /// No valid pivot remained (or no progress was possible), so the final
+    /// iterate is a witness.
+    case witness
+    /// The iteration budget ran out before either proof.
+    case exhausted
+}
+
 struct Trajectory: Identifiable {
     let id = UUID()
     let points: [CGPoint]
-    /// The pivot vertex used for each step: `pivots[i]` carried the iterate
-    /// from `points[i]` to `points[i + 1]`.
-    let pivots: [CGPoint]
-    /// True if the iterate got within epsilon of the query point;
-    /// false means the final point is a witness (proof of non-membership).
-    let converged: Bool
+    /// What each step did: `steps[i]` carried the iterate from `points[i]`
+    /// to `points[i + 1]`, naming the vertices it moved toward or away from.
+    let steps: [TraceStep]
+    let outcome: TraceOutcome
+    var converged: Bool { outcome == .converged }
+    /// The vertex called out as each step's pivot.
+    var pivots: [CGPoint] { steps.map(\.pivot) }
 }
 
 enum TriangleAlgorithm {
@@ -107,8 +120,7 @@ enum TriangleAlgorithm {
     /// point on segment [x, v] nearest to p. Stops with a witness if no pivot exists.
     /// One iteration from `x`: the best valid pivot and the point on
     /// segment [x, pivot] nearest to p. Nil when no pivot exists (x is a
-    /// witness) — the shared kernel of `trace`, `stepCount`, and the
-    /// partition mode.
+    /// witness) — the shared kernel of `trace` and `stepCount`.
     nonisolated static func step(
         from x: CGPoint,
         vertices: [CGPoint],
@@ -125,34 +137,32 @@ enum TriangleAlgorithm {
         return best
     }
 
+    /// Traces iterates under the chosen step strategy. Every strategy stops
+    /// the same way: converged within epsilon of p, a witness once no valid
+    /// pivot (or no progress) remains, or exhausted at the iteration cap.
     nonisolated static func trace(
         from start: CGPoint,
         vertices: [CGPoint],
         target p: CGPoint,
+        strategy: StepStrategy = .toward,
+        blockSize: Int = 4,
         epsilon: CGFloat = 1.0,
         maxIterations: Int = 500
-    ) -> (points: [CGPoint], pivots: [CGPoint], converged: Bool) {
-        var x = start
-        var path = [x]
-        var pivots: [CGPoint] = []
-        guard !vertices.isEmpty else { return (path, pivots, false) }
+    ) -> (points: [CGPoint], steps: [TraceStep], outcome: TraceOutcome) {
+        var solver = StepSolver(start: start, vertices: vertices, target: p,
+                                strategy: strategy, blockSize: blockSize)
+        var path = [start]
+        var steps: [TraceStep] = []
+        guard !vertices.isEmpty else { return (path, steps, .witness) }
 
         for _ in 0..<maxIterations {
-            let currentGap = distance(x, p)
-            if currentGap <= epsilon { return (path, pivots, true) }
-
-            // Among all valid pivots, greedily take the one whose segment
-            // projection lands nearest to p.
+            if solver.gap <= epsilon { return (path, steps, .converged) }
             // No pivot (or no progress possible): x is a witness.
-            guard let step = step(from: x, vertices: vertices, target: p),
-                  step.gap < currentGap else {
-                return (path, pivots, false)
-            }
-            x = step.next
-            path.append(x)
-            pivots.append(vertices[step.pivotIndex])
+            guard let step = solver.advance() else { return (path, steps, .witness) }
+            path.append(solver.x)
+            steps.append(step)
         }
-        return (path, pivots, distance(x, p) <= epsilon)
+        return (path, steps, solver.gap <= epsilon ? .converged : .exhausted)
     }
 
     /// Like `trace`, but only counts steps — cheap enough to sample many
@@ -161,24 +171,24 @@ enum TriangleAlgorithm {
         from start: CGPoint,
         vertices: [CGPoint],
         target p: CGPoint,
+        strategy: StepStrategy = .toward,
+        blockSize: Int = 4,
         epsilon: CGFloat = 1.0,
         maxIterations: Int = 150
     ) -> Int {
-        var x = start
         guard !vertices.isEmpty else { return 0 }
+        var solver = StepSolver(start: start, vertices: vertices, target: p,
+                                strategy: strategy, blockSize: blockSize)
         for iteration in 0..<maxIterations {
-            let currentGap = distance(x, p)
-            if currentGap <= epsilon { return iteration }
-            guard let step = step(from: x, vertices: vertices, target: p),
-                  step.gap < currentGap else { return iteration }
-            x = step.next
+            if solver.gap <= epsilon { return iteration }
+            guard solver.advance() != nil else { return iteration }
         }
         return maxIterations
     }
 }
 
 /// A grid of triangle-algorithm step counts sampled across the canvas,
-/// backing the iteration-intensity coloring mode.
+/// backing the iteration-intensity coloring mode and the partition mode.
 struct IterationField {
     let cellSize: CGFloat
     let columns: Int
@@ -189,9 +199,8 @@ struct IterationField {
     /// Renders the sampled counts into a bitmap with one pixel per cell.
     /// Drawing it scaled up with interpolation smooths the gradient far
     /// beyond the sampling resolution. Unsampled cells stay transparent.
-    func makeImage(baseColor: UIColor) -> CGImage? {
-        var red: CGFloat = 0, green: CGFloat = 0, blue: CGFloat = 0, baseAlpha: CGFloat = 0
-        baseColor.getRed(&red, green: &green, blue: &blue, alpha: &baseAlpha)
+    func makeImage(baseColor: PlatformColor) -> CGImage? {
+        let (red, green, blue, baseAlpha) = baseColor.rgbaComponents
         var pixels = [UInt8](repeating: 0, count: columns * rows * 4)
         for index in counts.indices {
             let steps = counts[index]
@@ -216,45 +225,6 @@ struct IterationField {
     }
 }
 
-/// A grid recording which hull vertex is the first pivot at each sampled
-/// point, backing the partition mode's region coloring. -1 marks cells
-/// outside the hull (or with no pivot), which stay transparent.
-struct PartitionField {
-    let cellSize: CGFloat
-    let columns: Int
-    let rows: Int
-    let pivotIndices: [Int]
-
-    /// Renders the partition into a bitmap with one pixel per cell, each
-    /// pivot's region filled with its own color.
-    func makeImage(colors: [UIColor]) -> CGImage? {
-        guard !colors.isEmpty else { return nil }
-        let components: [(r: CGFloat, g: CGFloat, b: CGFloat, a: CGFloat)] = colors.map { color in
-            var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
-            color.getRed(&r, green: &g, blue: &b, alpha: &a)
-            return (r, g, b, a)
-        }
-        var pixels = [UInt8](repeating: 0, count: columns * rows * 4)
-        for index in pivotIndices.indices {
-            let pivot = pivotIndices[index]
-            guard pivot >= 0 else { continue }
-            let c = components[pivot % components.count]
-            let offset = index * 4
-            pixels[offset] = UInt8(max(0, min(255, c.r * c.a * 255)))
-            pixels[offset + 1] = UInt8(max(0, min(255, c.g * c.a * 255)))
-            pixels[offset + 2] = UInt8(max(0, min(255, c.b * c.a * 255)))
-            pixels[offset + 3] = UInt8(max(0, min(255, c.a * 255)))
-        }
-        return pixels.withUnsafeMutableBytes { buffer in
-            CGContext(data: buffer.baseAddress, width: columns, height: rows,
-                      bitsPerComponent: 8, bytesPerRow: columns * 4,
-                      space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)?
-                .makeImage()
-        }
-    }
-}
-
 // MARK: - Content view
 
 struct ContentView: View {
@@ -268,8 +238,8 @@ struct ContentView: View {
         case paths = "Paths"
         /// The colored version: regions between paths filled from a palette.
         case regions = "Regions"
-        /// One iteration from every point of the hull, colored by which
-        /// vertex serves as the first pivot.
+        /// Every point of the hull shaded in one color, its intensity set
+        /// by how many iterations the algorithm needs from there.
         case partition = "Partition"
 
         var id: String { rawValue }
@@ -330,7 +300,7 @@ struct ContentView: View {
         case regionsWatch
         case regionsPaint
         case regionsThemes
-        // Partition: the hull colored by each point's first pivot.
+        // Partition: the hull shaded by how many iterations each point needs.
         case partitionRun
         case partitionRead
         case partitionLive
@@ -386,7 +356,7 @@ struct ContentView: View {
                     ? "Now drag p inside the triangle and press Run again — this time the iterate should reach it."
                     : "Now drag p outside the triangle and press Run again — with no valid pivot left, the iterate stops as a ✕ witness."
             case .explore:
-                "That's the whole algorithm! Explore the modes up top: Paths traces many starts at once, Regions paints the areas between paths, and Partition colors the hull by each point's first pivot. Each has its own tutorial under the ⋯ menu."
+                "That's the whole algorithm! Explore the modes up top: Paths traces many starts at once, Regions paints the areas between paths, and Partition shades the hull by how many iterations each point needs. Each has its own tutorial under the ⋯ menu."
             case .pathsLoadShape:
                 "Paths traces a whole set of starting iterates at once. Load a point set from the shape menu below — Circle is a good start — or tap points by hand and press Run."
             case .pathsWatch:
@@ -404,11 +374,11 @@ struct ContentView: View {
             case .regionsThemes:
                 "Nice! Themes, a custom palette, and the Iteration-intensity coloring live under ⋯ → Settings, and the share button exports the picture as a poster. Last stop: the Partition tutorial, under ⋯."
             case .partitionRun:
-                "Partition answers one question: from each point inside the hull, which vertex does the algorithm pivot on first? Load a shape from the menu below or tap your own points, then press Run."
+                "Partition answers one question: starting from each point inside the hull, how many iterations does the algorithm need to reach p? Load a shape from the menu below or tap your own points, then press Run."
             case .partitionRead:
-                "Each color is one vertex's territory: every point in a region makes its first pivot at the vertex wearing that color."
+                "One color, many shades: the deeper the tint, the more iterations the algorithm takes from that point. Pale regions converge almost at once."
             case .partitionLive:
-                "Drag p and watch the territories reshape around it. That's the full tour — replay any tutorial from the ⋯ menu."
+                "Drag p and watch the shading reshape around it. That's the full tour — replay any tutorial from the ⋯ menu."
             }
         }
     }
@@ -419,7 +389,7 @@ struct ContentView: View {
     struct PosterImage: Identifiable {
         var id: String { "poster" }
         let image: Image
-        let uiImage: UIImage
+        let platformImage: PlatformImage
         let pixelSize: CGSize
     }
 
@@ -471,14 +441,27 @@ struct ContentView: View {
     @State private var fieldTask: Task<Void, Never>? = nil
     @State private var isBuildingField = false
     @State private var fieldProgress: Double = 0
-    @State private var partitionField: PartitionField? = nil
+    @State private var partitionField: IterationField? = nil
     @State private var partitionImage: CGImage? = nil
     @State private var iterateScheme: IterateScheme = .border
+    /// The step rule every trace (and the intensity field) runs under.
+    @AppStorage("stepStrategy") private var stepStrategy: StepStrategy = .toward
+    /// Pairs per scan for the guarded block strategy.
+    @AppStorage("blockSize") private var blockSize = 4
     @AppStorage("iterateCount") private var iterateCount = 8
     @AppStorage("trajectoryLineWidth") private var trajectoryLineWidth = 4.0
     @AppStorage("hullLineWidth") private var hullLineWidth = 3.0
     @AppStorage("pointMarkerSize") private var pointMarkerSize = 6.0
     @State private var showSettings = false
+    /// Basic mode's "why this pivot" card; dismissed per run, back on the next.
+    @State private var showPivotExplanation = true
+    /// Basic mode: reveal the trace one step per tap instead of on a timer.
+    @AppStorage("basicManualStepping") private var manualStepping = false
+    /// How many steps of a manual run have been taken so far.
+    @State private var revealedSteps = 0
+    /// The step the card (and the pivot demo) is showing once a run has
+    /// finished and the user is paging through it.
+    @State private var reviewedStep = 0
     @State private var startPoints: [CGPoint] = []
     @State private var isEditingIterates = false
     @State private var isPaintingWedges = false
@@ -499,6 +482,7 @@ struct ContentView: View {
     @State private var isSavingToPhotos = false
     @State private var didSaveToPhotos = false
     @State private var showSaveFailedAlert = false
+    @State private var showPosterRenderFailedAlert = false
     @State private var soundEngine = SoundEngine()
 
     /// Basic mode traces slowly enough to follow each pivot; the other
@@ -508,13 +492,29 @@ struct ContentView: View {
 
     private var hasRun: Bool { !trajectories.isEmpty }
 
+    /// Steps in Basic mode's single trace.
+    private var totalSteps: Int { trajectories.first?.steps.count ?? 0 }
+
+    /// A Basic-mode run being revealed by hand rather than on the timer.
+    private var isManualRun: Bool { mode == .basic && manualStepping && hasRun }
+
+    /// A manual run with steps still to take: the picture and verdict are
+    /// incomplete, exactly as during an animated trace.
+    private var isManualStepping: Bool { isManualRun && revealedSteps < totalSteps }
+
     /// Whether the current mode has a finished picture worth exporting.
     private var hasResult: Bool { mode == .partition ? partitionField != nil : hasRun }
 
+    /// The membership verdict: true (inside), false (outside), or nil when
+    /// there is no run — or when every trajectory merely ran out of
+    /// iterations, which proves nothing.
     private var membershipResult: Bool? {
         guard hasRun, mode != .partition else { return nil }
-        // A single witness proves non-membership; otherwise all trajectories converged.
-        return trajectories.allSatisfy(\.converged)
+        // One converged trajectory is a constructive proof that p is in the
+        // hull; failing that, one genuine witness proves it is outside.
+        if trajectories.contains(where: { $0.outcome == .converged }) { return true }
+        if trajectories.contains(where: { $0.outcome == .witness }) { return false }
+        return nil
     }
 
     var body: some View {
@@ -535,6 +535,7 @@ struct ContentView: View {
                     if let step = tutorialStep {
                         tutorialCard(step)
                     }
+                    pivotExplanationCard
                     controlBar
                 }
                 .padding()
@@ -566,9 +567,13 @@ struct ContentView: View {
         }
         .task(id: runStart) {
             // Stop the timeline once the longest trajectory has fully traced.
+            // Clamped to the score's cap so a run that hit the iteration
+            // limit jumps to its finished picture when the audio ends
+            // instead of animating for minutes past it.
             guard runStart != nil, isAnimating else { return }
             let maxSteps = trajectories.map(\.points.count).max() ?? 0
-            let duration = Double(maxSteps) / stepsPerSecond + 0.4
+            let duration = min(Double(max(maxSteps - 1, 0)) / stepsPerSecond + 0.4,
+                               SoundEngine.maxScoreDuration)
             try? await Task.sleep(for: .seconds(duration))
             withAnimation(.spring(duration: 0.4)) { isAnimating = false }
         }
@@ -578,7 +583,8 @@ struct ContentView: View {
             while isAmbient && !Task.isCancelled {
                 randomExample()
                 let maxSteps = trajectories.map(\.points.count).max() ?? 0
-                let traceDuration = Double(maxSteps) / stepsPerSecond + 0.4
+                let traceDuration = min(Double(max(maxSteps - 1, 0)) / stepsPerSecond + 0.4,
+                                        SoundEngine.maxScoreDuration)
                 // Let the finished composition hang on screen before repainting.
                 try? await Task.sleep(for: .seconds(traceDuration + 3.5))
             }
@@ -649,10 +655,10 @@ struct ContentView: View {
         .onChange(of: palette) { _, newPalette in
             // The fields' data survives a theme change; only re-tint the bitmaps.
             if let field = iterationField {
-                fieldImage = field.makeImage(baseColor: UIColor(newPalette.intensityBase))
+                fieldImage = field.makeImage(baseColor: PlatformColor(newPalette.intensityBase))
             }
             if let field = partitionField {
-                partitionImage = field.makeImage(colors: partitionColors(for: newPalette))
+                partitionImage = field.makeImage(baseColor: PlatformColor(newPalette.intensityBase))
             }
         }
         .onChange(of: mode) { _, newMode in
@@ -709,6 +715,42 @@ struct ContentView: View {
             startPoints = points
             if hasRun { recompute(animated: false) }
         }
+        .onChange(of: manualStepping) { _, _ in
+            // Switching the stepping style mid-run keeps the finished
+            // picture on screen; the next Run starts in the new style.
+            guard mode == .basic else { return }
+            stopTrace()
+            revealedSteps = totalSteps
+        }
+        .onChange(of: revealedSteps) { _, taken in
+            // Manual runs drive the Basic tutorial the way an animation
+            // ending does: the last step taken moves on to the verdict.
+            guard isManualRun, taken >= totalSteps, let step = tutorialStep else { return }
+            let advanced: TutorialStep?
+            switch step {
+            case .watchTrace:
+                tutorialVerdict = membershipResult
+                advanced = .readResult
+            case .tryOtherSide: advanced = .explore
+            default: advanced = nil
+            }
+            if let advanced {
+                withAnimation(.spring(duration: 0.35)) { tutorialStep = advanced }
+            }
+        }
+        .sensoryFeedback(trigger: revealedSteps) { _, taken in
+            guard isManualRun else { return nil }
+            if taken >= totalSteps, let inside = membershipResult { return inside ? .success : .error }
+            return .selection
+        }
+        .onChange(of: stepStrategy) { _, _ in
+            // A finished picture re-traces under the new rule in place, so
+            // the strategies can be compared on the same hull and target.
+            if hasResult { recompute(animated: false) }
+        }
+        .onChange(of: blockSize) { _, _ in
+            if hasResult, stepStrategy == .block { recompute(animated: false) }
+        }
         .alert("Add hull points first", isPresented: $showAddHullPointsAlert) {
             Button("OK", role: .cancel) { }
         } message: {
@@ -716,6 +758,11 @@ struct ContentView: View {
         }
         .sheet(item: $poster) { poster in
             posterSheet(for: poster)
+        }
+        .alert("Couldn't render the poster", isPresented: $showPosterRenderFailedAlert) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text("There wasn't enough memory to render at this size. Try a lower export resolution.")
         }
         .sheet(isPresented: $showSettings) {
             settingsSheet
@@ -747,6 +794,22 @@ struct ContentView: View {
                             Text(mode.rawValue).tag(mode)
                         }
                     }
+                }
+                Section {
+                    Picker("Step strategy", selection: $stepStrategy) {
+                        ForEach(StepStrategy.allCases) { strategy in
+                            Label(strategy.name, systemImage: strategy.symbol).tag(strategy)
+                        }
+                    }
+                    if stepStrategy == .block {
+                        Stepper(value: $blockSize, in: 1...16) {
+                            LabeledContent("Block size k", value: "\(blockSize)")
+                        }
+                    }
+                } header: {
+                    Text("Algorithm")
+                } footer: {
+                    Text(stepStrategy.summary)
                 }
                 Section("Trace") {
                     Toggle(isOn: $showBisector) {
@@ -785,7 +848,7 @@ struct ContentView: View {
                 }
             }
             .navigationTitle("Settings")
-            .navigationBarTitleDisplayMode(.inline)
+            .inlineNavigationTitle()
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { showSettings = false }
@@ -795,7 +858,7 @@ struct ContentView: View {
                 CustomPaletteEditor(data: customPaletteBinding)
             }
         }
-        .presentationDetents([.medium, .large])
+        .mediumOrLargeDetents()
     }
 
     /// The stored custom palette, falling back to the starter set.
@@ -862,6 +925,9 @@ struct ContentView: View {
                 if mode == .paths || (mode == .regions && coloringMode == .palette) {
                     iterateMenu
                 }
+                // The step rule shapes every trace, including the iteration
+                // counts behind the partition shading.
+                strategyMenu
                 if mode == .regions && coloringMode == .palette && hasRun {
                     paintButton
                 }
@@ -918,17 +984,21 @@ struct ContentView: View {
     }
 
     /// Membership verdict as a single dot beside the menu buttons:
-    /// green for inside the hull, red for a witness (outside).
+    /// green for inside the hull, red for a witness (outside), orange when
+    /// every trace hit the iteration cap and the run proved nothing.
     @ViewBuilder
     private var resultDot: some View {
-        if let inside = membershipResult, !isAnimating {
+        if hasRun, mode != .partition, !isAnimating, !isManualStepping {
+            let inside = membershipResult
             Circle()
-                .fill(inside ? Color.green : Color.red)
+                .fill(inside == true ? Color.green : inside == false ? Color.red : Color.orange)
                 .frame(width: 12, height: 12)
                 .padding(10)
                 .glassEffect()
                 .transition(.opacity)
-                .accessibilityLabel(inside ? "Inside the convex hull" : "Outside — witness found")
+                .accessibilityLabel(inside == true ? "Inside the convex hull"
+                                    : inside == false ? "Outside — witness found"
+                                    : "Inconclusive — iteration limit reached")
         }
     }
 
@@ -1011,17 +1081,173 @@ struct ContentView: View {
     }
 
     private var pointCountStatus: String {
+        // Everything downstream (Run, iterates, the fields) tests the convex
+        // hull, not the raw count — collinear points have no interior, so the
+        // chip must not announce a hull that doesn't exist.
+        let hullCount = convexHull(of: hullPoints).count
         if mode == .basic {
-            return hullPoints.count < 3
-                ? "\(hullPoints.count) of 3 triangle points"
-                : "Triangle ready — drag the corners, target, or start square, then Run"
+            if hullPoints.count < 3 {
+                return "\(hullPoints.count) of 3 triangle points"
+            }
+            if hullCount < 3 {
+                return "Corners are on one line — drag one to open the triangle"
+            }
+            // After a run, account for the steps so the strategies can be
+            // compared by eye: how many steps, and of which kinds.
+            if hasRun, !isAnimating, !isManualStepping, let summary = stepSummary {
+                return summary
+            }
+            return "Triangle ready — drag the corners, target, or start square, then Run"
         }
         if mode == .partition && partitionField != nil {
             return "\(hullPoints.count) points — drag the target to reshape the partition"
         }
-        return hullPoints.count < 3
-            ? "\(hullPoints.count) point\(hullPoints.count == 1 ? "" : "s") — add at least 3"
+        if hullPoints.count < 3 {
+            return "\(hullPoints.count) point\(hullPoints.count == 1 ? "" : "s") — add at least 3"
+        }
+        return hullCount < 3
+            ? "\(hullPoints.count) points on one line — add one off it"
             : "\(hullPoints.count) points — press Run"
+    }
+
+    /// The step the pivot demo and explanation card are focused on: the
+    /// one being traced while animating, else the one the user paged to.
+    private func focusedStepIndex(at date: Date, stepCount: Int) -> Int {
+        guard stepCount > 0 else { return 0 }
+        if isAnimating, let start = runStart {
+            let progress = max(0, date.timeIntervalSince(start)) * stepsPerSecond
+            return min(max(Int(progress), 0), stepCount - 1)
+        }
+        return min(max(reviewedStep, 0), stepCount - 1)
+    }
+
+    /// Basic mode's small "why this pivot" card. While the trace animates it
+    /// narrates the step being drawn; afterwards it pages through the run,
+    /// and the pivot demo highlights whichever step is showing.
+    ///
+    /// In manual stepping the card is also the controller: Next takes the
+    /// step it is describing, Back undoes it, and the trace on the canvas
+    /// grows one segment at a time.
+    @ViewBuilder
+    private var pivotExplanationCard: some View {
+        if mode == .basic, showPivotExplanation || isManualRun, tutorialStep == nil,
+           let trajectory = trajectories.first, !trajectory.steps.isEmpty {
+            TimelineView(.animation(minimumInterval: 0.1, paused: !isAnimating)) { timeline in
+                let steps = trajectory.steps
+                let manual = isManualRun
+                let taken = min(revealedSteps, steps.count)
+                let index = manual ? min(taken, steps.count - 1)
+                                   : focusedStepIndex(at: timeline.date, stepCount: steps.count)
+                let step = steps[index]
+                let pending = manual && taken < steps.count
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 14) {
+                        Text(pending ? "Next: step \(index + 1) of \(steps.count) · \(step.kind.label)"
+                                     : "Step \(index + 1) of \(steps.count) · \(step.kind.label)")
+                            .font(.subheadline.bold())
+                            .monospacedDigit()
+                        Spacer()
+                        if manual {
+                            Button {
+                                revealManualSteps(taken - 1)
+                            } label: {
+                                Image(systemName: "chevron.left")
+                            }
+                            .disabled(taken == 0)
+                            .accessibilityLabel("Back one step")
+                            Button {
+                                revealManualSteps(taken + 1)
+                            } label: {
+                                Label("Next", systemImage: "chevron.right")
+                                    .labelStyle(.titleAndIcon)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .buttonBorderShape(.capsule)
+                            .controlSize(.small)
+                            .disabled(!pending)
+                            .accessibilityLabel("Take the next step")
+                            if pending {
+                                Button("Skip to end") {
+                                    revealManualSteps(steps.count)
+                                }
+                                .font(.caption)
+                            }
+                        } else {
+                            if !isAnimating {
+                                Button {
+                                    reviewedStep = index - 1
+                                } label: {
+                                    Image(systemName: "chevron.left")
+                                }
+                                .disabled(index == 0)
+                                .accessibilityLabel("Previous step")
+                                Button {
+                                    reviewedStep = index + 1
+                                } label: {
+                                    Image(systemName: "chevron.right")
+                                }
+                                .disabled(index == steps.count - 1)
+                                .accessibilityLabel("Next step")
+                            }
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.2)) { showPivotExplanation = false }
+                            } label: {
+                                Image(systemName: "xmark")
+                            }
+                            .accessibilityLabel("Hide pivot explanation")
+                        }
+                    }
+                    .font(.subheadline)
+                    Text(step.reason)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if manual, !pending {
+                        Text(trajectory.outcome == .converged
+                             ? "The iterate reached p: p is inside the triangle."
+                             : trajectory.outcome == .witness
+                                ? "No valid pivot is left: the iterate is a witness, so p is outside."
+                                : "The iteration cap was reached without a verdict.")
+                            .font(.caption.bold())
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .frame(maxWidth: 440)
+                .glassEffect(in: .rect(cornerRadius: 16))
+                .accessibilityElement(children: .combine)
+            }
+            .transition(.opacity)
+        }
+    }
+
+    /// Reveals a manual run up to `count` steps, with a tick for each step
+    /// newly taken (and the run's cadence when the last one lands).
+    private func revealManualSteps(_ count: Int) {
+        let target = min(max(count, 0), totalSteps)
+        let previous = revealedSteps
+        revealedSteps = target
+        guard target > previous, soundOn, let trajectory = trajectories.first,
+              let first = trajectory.points.first, let p = queryPoint else { return }
+        let initialGap = max(distance(first, p), 1)
+        // Skipping ahead plays the remaining ticks in quick succession.
+        let gaps = trajectory.points[(previous + 1)...target].map { min(1, Double(distance($0, p) / initialGap)) }
+        soundEngine.play(voices: [SoundEngine.Voice(gaps: gaps, converged: trajectory.converged,
+                                                     playsCadence: target == totalSteps)],
+                         stepsPerSecond: 12)
+    }
+
+    /// Basic mode's run summary: step count under the current strategy and
+    /// a breakdown by step kind when more than one kind occurred.
+    private var stepSummary: String? {
+        guard let trajectory = trajectories.first, !trajectory.steps.isEmpty else { return nil }
+        let steps = trajectory.steps
+        let counts = StepKind.allCases.compactMap { kind -> String? in
+            let n = steps.filter { $0.kind == kind }.count
+            return n > 0 ? "\(n) \(kind.label)" : nil
+        }
+        let head = "\(steps.count) step\(steps.count == 1 ? "" : "s") · \(stepStrategy.name)"
+        return counts.count > 1 ? "\(head): \(counts.joined(separator: ", "))" : head
     }
 
     private var iterateMenu: some View {
@@ -1049,6 +1275,31 @@ struct ContentView: View {
         }
         .buttonStyle(.glass)
         .accessibilityLabel("Iterate scheme")
+    }
+
+    /// Quick access to the anti-zig-zag step strategies from the paper; the
+    /// same choice, with a fuller description, lives under Settings.
+    private var strategyMenu: some View {
+        Menu {
+            Picker("Step strategy", selection: $stepStrategy) {
+                ForEach(StepStrategy.allCases) { strategy in
+                    Label(strategy.name, systemImage: strategy.symbol).tag(strategy)
+                }
+            }
+            if stepStrategy == .block {
+                Divider()
+                Picker("Block size", selection: $blockSize) {
+                    ForEach(StepStrategy.blockSizes, id: \.self) { k in
+                        Text("k = \(k)").tag(k)
+                    }
+                }
+                .pickerStyle(.menu)
+            }
+        } label: {
+            Image(systemName: stepStrategy.symbol)
+        }
+        .buttonStyle(.glass)
+        .accessibilityLabel("Step strategy: \(stepStrategy.name)")
     }
 
     /// Gates edit mode behind having a hull to edit inside: without at least
@@ -1090,7 +1341,7 @@ struct ContentView: View {
         .accessibilityLabel("About the Triangle Algorithm")
         .popover(isPresented: $showInfo) {
             infoContent
-                .presentationCompactAdaptation(.popover)
+                .keepPopoverCompact()
         }
     }
 
@@ -1217,8 +1468,17 @@ struct ContentView: View {
                 .disabled(runDisabled)
 
                 // Basic mode is the hand-placed triangle; the sampled shapes
-                // belong to the richer tiers.
-                if mode != .basic {
+                // belong to the richer tiers. It gets the stepping style
+                // instead: let the trace play, or take it one step per tap.
+                if mode == .basic {
+                    Picker("Stepping", selection: $manualStepping) {
+                        Text("Auto").tag(false)
+                        Text("Step").tag(true)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 130)
+                    .accessibilityLabel("Stepping style")
+                } else {
                     shapeMenu
                 }
 
@@ -1374,7 +1634,11 @@ struct ContentView: View {
                     syncIteratesToHull()
                 case .start(let index) where startPoints.indices.contains(index):
                     startPoints[index] = clampToConvexHull(value.location, hull: convexHull(of: hullPoints))
-                    iterateScheme = .custom
+                    // Basic mode's single start is managed by syncIteratesToHull,
+                    // not the scheme; flipping to .custom here would silently
+                    // replace the other modes' default layouts with this one
+                    // point on the next mode switch.
+                    if mode != .basic { iterateScheme = .custom }
                 default:
                     break
                 }
@@ -1501,6 +1765,8 @@ struct ContentView: View {
             return
         }
         let vertices = hullPoints
+        let strategy = stepStrategy
+        let blockSize = blockSize
         isBuildingField = !coarse
         fieldProgress = 0
         fieldTask = Task.detached(priority: .userInitiated) {
@@ -1515,7 +1781,8 @@ struct ContentView: View {
                         let start = CGPoint(x: (CGFloat(column) + 0.5) * cellSize,
                                             y: (CGFloat(row) + 0.5) * cellSize)
                         guard isInsideConvexHull(start, hull: hull) else { continue }
-                        let steps = TriangleAlgorithm.stepCount(from: start, vertices: vertices, target: p)
+                        let steps = TriangleAlgorithm.stepCount(from: start, vertices: vertices, target: p,
+                                                                strategy: strategy, blockSize: blockSize)
                         counts[row * columns + column] = steps
                         maxCount = max(maxCount, steps)
                     }
@@ -1525,8 +1792,12 @@ struct ContentView: View {
                                              rows: rows, counts: counts, maxCount: maxCount)
                 let progress = Double(batchEnd) / Double(rows)
                 await MainActor.run {
+                    // Re-check inside the main-actor hop: MainActor.run is not
+                    // a cancellation point, so a build cancelled during the
+                    // suspension must not resurrect a field the cancel cleared.
+                    guard !Task.isCancelled else { return }
                     iterationField = partial
-                    fieldImage = partial.makeImage(baseColor: UIColor(palette.intensityBase))
+                    fieldImage = partial.makeImage(baseColor: PlatformColor(palette.intensityBase))
                     if !coarse {
                         fieldProgress = progress
                         if batchEnd == rows { isBuildingField = false }
@@ -1544,21 +1815,9 @@ struct ContentView: View {
         isBuildingField = false
     }
 
-    /// The region colors for partition mode, one per hull vertex (cycled):
-    /// accents first so neighboring regions read as distinct.
-    private func partitionSliceColors(for palette: Palette) -> [Color] {
-        let accents = palette.slices.filter { !$0.isNeutral }.map(\.color)
-        let neutrals = palette.slices.filter(\.isNeutral).map(\.color)
-        return accents + neutrals
-    }
-
-    private func partitionColors(for palette: Palette) -> [UIColor] {
-        partitionSliceColors(for: palette).map(UIColor.init)
-    }
-
-    /// Samples the hull's interior and records which vertex the algorithm
-    /// pivots on first from each cell, coloring the hull into the pivot's
-    /// partition regions.
+    /// Samples the hull's interior and counts how many iterations the
+    /// algorithm needs from each cell to reach the target, shading the hull
+    /// in a single color whose intensity grows with the count.
     ///
     /// Runs in the same cancellable background pipeline as the intensity
     /// field; `coarse` gives quick low-resolution feedback during drags.
@@ -1573,11 +1832,11 @@ struct ContentView: View {
             return
         }
         let vertices = hullPoints
-        // Partition sampling is one iteration per cell, far cheaper than the
-        // intensity field's full traces, so it affords a much denser grid —
-        // one sample per 0.75pt puts a cell roughly every two device pixels
-        // on a 3× display, so region boundaries stay crisp curves.
-        let cellSize: CGFloat = coarse ? 8 : 0.75
+        let strategy = stepStrategy
+        let blockSize = blockSize
+        // Every cell runs a full trace, so the grid is a little denser than
+        // the intensity field's but nowhere near per-pixel.
+        let cellSize: CGFloat = coarse ? 10 : 2
         let columns = Int(ceil(canvasSize.width / cellSize))
         let rows = Int(ceil(canvasSize.height / cellSize))
         guard columns > 0, rows > 0 else {
@@ -1586,12 +1845,13 @@ struct ContentView: View {
             isBuildingField = false
             return
         }
-        let colors = partitionColors(for: palette)
+        let baseColor = PlatformColor(palette.intensityBase)
         isBuildingField = !coarse
         fieldProgress = 0
         fieldTask = Task.detached(priority: .userInitiated) {
-            var pivots = [Int](repeating: -1, count: columns * rows)
-            let batchRows = 24
+            var counts = [Int](repeating: -1, count: columns * rows)
+            var maxCount = 1
+            let batchRows = max(6, rows / 12 + 1)
             for batchStart in stride(from: 0, to: rows, by: batchRows) {
                 let batchEnd = min(batchStart + batchRows, rows)
                 for row in batchStart..<batchEnd {
@@ -1599,19 +1859,23 @@ struct ContentView: View {
                     for column in 0..<columns {
                         let start = CGPoint(x: (CGFloat(column) + 0.5) * cellSize,
                                             y: (CGFloat(row) + 0.5) * cellSize)
-                        guard isInsideConvexHull(start, hull: hull),
-                              let step = TriangleAlgorithm.step(from: start, vertices: vertices, target: p)
-                        else { continue }
-                        pivots[row * columns + column] = step.pivotIndex
+                        guard isInsideConvexHull(start, hull: hull) else { continue }
+                        let steps = TriangleAlgorithm.stepCount(from: start, vertices: vertices, target: p,
+                                                                strategy: strategy, blockSize: blockSize)
+                        counts[row * columns + column] = steps
+                        maxCount = max(maxCount, steps)
                     }
                 }
                 if Task.isCancelled { return }
-                let partial = PartitionField(cellSize: cellSize, columns: columns,
-                                             rows: rows, pivotIndices: pivots)
+                let partial = IterationField(cellSize: cellSize, columns: columns,
+                                             rows: rows, counts: counts, maxCount: maxCount)
                 let progress = Double(batchEnd) / Double(rows)
                 await MainActor.run {
+                    // Same re-check as the intensity field: don't let a
+                    // cancelled build land one last write after the fact.
+                    guard !Task.isCancelled else { return }
                     partitionField = partial
-                    partitionImage = partial.makeImage(colors: colors)
+                    partitionImage = partial.makeImage(baseColor: baseColor)
                     if !coarse {
                         fieldProgress = progress
                         if batchEnd == rows { isBuildingField = false }
@@ -1625,8 +1889,8 @@ struct ContentView: View {
 
     private func recompute(animated: Bool) {
         guard let p = queryPoint, !hullPoints.isEmpty, canvasSize != .zero else { return }
-        // Partition mode has no trajectories: Run builds the first-pivot
-        // field and the one-step arrows instead.
+        // Partition mode has no trajectories: Run builds the iteration-count
+        // shading over the hull instead.
         if mode == .partition {
             rebuildPartition(coarse: activeDrag != nil)
             runStart = nil
@@ -1644,11 +1908,28 @@ struct ContentView: View {
         }
         guard !startPoints.isEmpty else { return }
         trajectories = startPoints.map { start in
-            let result = TriangleAlgorithm.trace(from: start, vertices: hullPoints, target: p)
-            return Trajectory(points: result.points, pivots: result.pivots, converged: result.converged)
+            let result = TriangleAlgorithm.trace(from: start, vertices: hullPoints, target: p,
+                                                 strategy: stepStrategy, blockSize: blockSize)
+            return Trajectory(points: result.points, steps: result.steps, outcome: result.outcome)
         }
         rebuildIterationField(coarse: activeDrag != nil)
-        if animated {
+        if animated, mode == .basic, manualStepping {
+            // Manual stepping: nothing moves until the user asks for the
+            // first step. The card takes over from the timeline and score.
+            showPivotExplanation = true
+            revealedSteps = 0
+            reviewedStep = 0
+            runStart = nil
+            isAnimating = false
+            soundEngine.stop()
+            if tutorialStep == .dragTarget || tutorialStep == .runIt {
+                withAnimation(.spring(duration: 0.35)) { tutorialStep = .watchTrace }
+            }
+        } else if animated {
+            // A fresh run brings the explanation back and parks the review
+            // on the final step, where the trace ends up.
+            showPivotExplanation = true
+            reviewedStep = max((trajectories.first?.steps.count ?? 1) - 1, 0)
             runStart = Date()
             isAnimating = true
             playRunScore(target: p)
@@ -1875,6 +2156,17 @@ struct ContentView: View {
 
     // MARK: Poster export
 
+    /// ImageRenderer silently returns nil once the bitmap runs to hundreds
+    /// of megapixels (8× on an iPad canvas). Cap the poster's pixel count so
+    /// a big canvas renders at the largest workable scale instead of failing.
+    private func posterScale(for resolution: ExportResolution) -> CGFloat {
+        // Approximates posterContent's size: canvas plus matte and caption.
+        let contentSize = CGSize(width: canvasSize.width + 56, height: canvasSize.height + 100)
+        let maxPixels: CGFloat = 64_000_000
+        let maxScale = sqrt(maxPixels / max(contentSize.width * contentSize.height, 1))
+        return min(resolution.scale, maxScale)
+    }
+
     private func sharePoster() {
         guard hasResult, !isAnimating, canvasSize != .zero, !isRenderingPoster else { return }
         isRenderingPoster = true
@@ -1885,21 +2177,39 @@ struct ContentView: View {
             try? await Task.sleep(for: .milliseconds(50))
             defer { isRenderingPoster = false }
             let renderer = ImageRenderer(content: posterContent)
-            renderer.scale = exportResolution.scale
-            guard let uiImage = renderer.uiImage else { return }
+            renderer.scale = posterScale(for: exportResolution)
+#if canImport(UIKit)
+            guard let platformImage = renderer.uiImage else {
+                showPosterRenderFailedAlert = true
+                return
+            }
+            let image = Image(uiImage: platformImage)
+            let pixelSize = CGSize(width: platformImage.size.width * platformImage.scale,
+                                   height: platformImage.size.height * platformImage.scale)
+#else
+            guard let platformImage = renderer.nsImage else {
+                showPosterRenderFailedAlert = true
+                return
+            }
+            let image = Image(nsImage: platformImage)
+            // NSImage reports points; the renderer's scale gives the pixel count.
+            let pixelSize = CGSize(width: platformImage.size.width * renderer.scale,
+                                   height: platformImage.size.height * renderer.scale)
+#endif
             didSaveToPhotos = false
             poster = PosterImage(
-                image: Image(uiImage: uiImage),
-                uiImage: uiImage,
-                pixelSize: CGSize(width: uiImage.size.width * uiImage.scale,
-                                  height: uiImage.size.height * uiImage.scale)
+                image: image,
+                platformImage: platformImage,
+                pixelSize: pixelSize
             )
         }
     }
 
     private var posterCaption: String {
-        if mode == .partition { return "first-pivot partition" }
-        return membershipResult == true ? "inside the hull" : "witness found"
+        if mode == .partition { return "\(stepStrategy.captionName(blockSize: blockSize)) · iteration partition" }
+        let steps = stepStrategy.captionName(blockSize: blockSize)
+        guard let inside = membershipResult else { return "\(steps) · iteration limit reached" }
+        return "\(steps) · \(inside ? "inside the hull" : "witness found")"
     }
 
     /// The finished composition matted and captioned like a gallery print.
@@ -1984,7 +2294,7 @@ struct ContentView: View {
             .disabled(isRenderingPoster || isSavingToPhotos || didSaveToPhotos)
         }
         .padding(.vertical, 28)
-        .presentationDetents([.medium, .large])
+        .mediumOrLargeDetents()
         .onChange(of: exportResolution) { _, _ in
             // Re-render the poster at the newly chosen scale.
             sharePoster()
@@ -2010,7 +2320,7 @@ struct ContentView: View {
             }
             do {
                 try await PHPhotoLibrary.shared().performChanges {
-                    PHAssetChangeRequest.creationRequestForAsset(from: poster.uiImage)
+                    PHAssetChangeRequest.creationRequestForAsset(from: poster.platformImage)
                 }
                 withAnimation(.easeInOut(duration: 0.2)) { didSaveToPhotos = true }
             } catch {
@@ -2025,6 +2335,8 @@ struct ContentView: View {
         let progress: Double
         if isAnimating, let start = runStart {
             progress = max(0, date.timeIntervalSince(start)) * stepsPerSecond
+        } else if isManualRun {
+            progress = Double(min(revealedSteps, totalSteps))
         } else {
             progress = .infinity
         }
@@ -2067,42 +2379,107 @@ struct ContentView: View {
     /// line runs from the current iterate to the vertex chosen as pivot,
     /// with a ring calling the pivot out; once finished, every step's pivot
     /// line stays faintly visible so the whole run can be read back.
+    ///
+    /// Under the anti-zig-zag strategies a step can also involve vertices
+    /// the iterate moves *away* from (weight donors) and a search direction
+    /// that points at no vertex at all (a pairwise or block transfer), so
+    /// the demo draws the search segment itself, rings the receivers, and
+    /// marks donors with a struck-through ring.
     private func drawPivotDemo(in context: inout GraphicsContext, upTo progress: Double) {
-        guard let trajectory = trajectories.first, !trajectory.pivots.isEmpty else { return }
+        guard let trajectory = trajectories.first, !trajectory.steps.isEmpty else { return }
         let points = trajectory.points
-        let pivots = trajectory.pivots
-        if progress >= Double(points.count - 1) {
-            for (index, pivot) in pivots.enumerated() {
-                var line = Path()
-                line.move(to: points[index])
-                line.addLine(to: pivot)
-                context.stroke(line, with: .color(palette.target.opacity(0.3)),
-                               style: StrokeStyle(lineWidth: 1.5, dash: [4, 4]))
+        let steps = trajectory.steps
+        let finished = progress >= Double(points.count - 1)
+        if finished {
+            for (index, step) in steps.enumerated() {
+                drawStepGuides(step, from: points[index], in: &context, opacity: 0.3, lineWidth: 1.5)
             }
-        } else {
-            let step = min(max(Int(progress), 0), pivots.count - 1)
-            let pivot = pivots[step]
-            var line = Path()
-            line.move(to: points[step])
-            line.addLine(to: pivot)
-            context.stroke(line, with: .color(palette.target.opacity(0.8)),
-                           style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
+        }
+        // While tracing, call out the step being drawn; once finished, the
+        // step the explanation card is paged to (if the card is showing).
+        if !finished || showPivotExplanation || isManualRun {
+            // A manual run's focus is the step just taken (or about to be);
+            // an auto run's is the one the card has been paged to.
+            let reviewed = isManualRun ? revealedSteps : reviewedStep
+            let index = finished
+                ? min(max(reviewed, 0), steps.count - 1)
+                : min(max(Int(progress), 0), steps.count - 1)
+            let step = steps[index]
+            drawStepGuides(step, from: points[index], in: &context, opacity: 0.8, lineWidth: 2)
+            if finished {
+                // Where the iterate stood when this step was taken.
+                let origin = points[index]
+                let halo = CGRect(x: origin.x - 7, y: origin.y - 7, width: 14, height: 14)
+                context.stroke(Path(ellipseIn: halo), with: .color(palette.target), lineWidth: 2)
+            }
             let ringRadius = pointMarkerSize + 7
-            let ring = CGRect(x: pivot.x - ringRadius, y: pivot.y - ringRadius,
-                              width: ringRadius * 2, height: ringRadius * 2)
-            context.stroke(Path(ellipseIn: ring), with: .color(palette.target), lineWidth: 3)
+            for receiver in step.receivers {
+                let ring = CGRect(x: receiver.x - ringRadius, y: receiver.y - ringRadius,
+                                  width: ringRadius * 2, height: ringRadius * 2)
+                context.stroke(Path(ellipseIn: ring), with: .color(palette.target), lineWidth: 3)
+            }
+            for donor in step.donors {
+                let ring = CGRect(x: donor.x - ringRadius, y: donor.y - ringRadius,
+                                  width: ringRadius * 2, height: ringRadius * 2)
+                context.stroke(Path(ellipseIn: ring), with: .color(palette.line), lineWidth: 3)
+                // A bar through the ring: this vertex is giving weight up.
+                var bar = Path()
+                bar.move(to: CGPoint(x: donor.x - ringRadius, y: donor.y))
+                bar.addLine(to: CGPoint(x: donor.x + ringRadius, y: donor.y))
+                context.stroke(bar, with: .color(palette.line), lineWidth: 3)
+            }
+            if step.kind == .midpoint {
+                // The virtual pivot: the midpoint the two best pivots blend into.
+                let r: CGFloat = pointMarkerSize * 0.7
+                var diamond = Path()
+                diamond.move(to: CGPoint(x: step.endpoint.x, y: step.endpoint.y - r))
+                diamond.addLine(to: CGPoint(x: step.endpoint.x + r, y: step.endpoint.y))
+                diamond.addLine(to: CGPoint(x: step.endpoint.x, y: step.endpoint.y + r))
+                diamond.addLine(to: CGPoint(x: step.endpoint.x - r, y: step.endpoint.y))
+                diamond.closeSubpath()
+                context.fill(diamond, with: .color(palette.target))
+            }
         }
     }
 
-    /// The first-pivot partition regions as a bitmap under the hull.
+    /// The dashed search segment of one step plus thin guides to the
+    /// vertices it involved: dashed in the target color toward receivers,
+    /// dotted in the line color toward donors.
+    private func drawStepGuides(_ step: TraceStep, from origin: CGPoint,
+                                in context: inout GraphicsContext,
+                                opacity: Double, lineWidth: CGFloat) {
+        var search = Path()
+        search.move(to: origin)
+        search.addLine(to: step.endpoint)
+        context.stroke(search, with: .color(palette.target.opacity(opacity)),
+                       style: StrokeStyle(lineWidth: lineWidth, dash: [6, 4]))
+        // A toward step's segment already ends at its receiver.
+        let guidedReceivers = step.kind == .toward ? [] : step.receivers
+        for receiver in guidedReceivers {
+            var guide = Path()
+            guide.move(to: origin)
+            guide.addLine(to: receiver)
+            context.stroke(guide, with: .color(palette.target.opacity(opacity * 0.6)),
+                           style: StrokeStyle(lineWidth: max(1, lineWidth - 1), dash: [3, 4]))
+        }
+        for donor in step.donors {
+            var guide = Path()
+            guide.move(to: origin)
+            guide.addLine(to: donor)
+            context.stroke(guide, with: .color(palette.line.opacity(opacity * 0.6)),
+                           style: StrokeStyle(lineWidth: max(1, lineWidth - 1), dash: [1, 4]))
+        }
+    }
+
+    /// The iteration-count shading as a bitmap under the hull: one color,
+    /// deepening with the number of steps needed from each point.
     private func drawPartitionField(in context: inout GraphicsContext) {
         guard let field = partitionField, let bitmap = partitionImage else { return }
         let rect = CGRect(x: 0, y: 0,
                           width: CGFloat(field.columns) * field.cellSize,
                           height: CGFloat(field.rows) * field.cellSize)
-        // Nearest-neighbor keeps the region boundaries crisp instead of
-        // blending neighboring regions into false colors.
-        let image = Image(decorative: bitmap, scale: 1).interpolation(.none)
+        // Interpolation smooths the sampled grid into a continuous gradient.
+        let image = Image(decorative: bitmap, scale: 1).interpolation(.medium)
         context.draw(image, in: rect)
     }
 
@@ -2152,16 +2529,19 @@ struct ContentView: View {
     }
 
     private func drawHullPoints(in context: inout GraphicsContext) {
-        // In partition mode each vertex wears its own region's color, so the
-        // coloring reads as a legend.
-        let regionColors = mode == .partition ? partitionSliceColors(for: palette) : []
         for (index, point) in hullPoints.enumerated() {
             let radius: CGFloat = activeDrag == .hull(index) ? pointMarkerSize + 3 : pointMarkerSize
             let rect = CGRect(x: point.x - radius, y: point.y - radius,
                               width: radius * 2, height: radius * 2)
-            let fill = regionColors.isEmpty ? palette.vertex : regionColors[index % regionColors.count]
-            context.fill(Path(ellipseIn: rect), with: .color(fill))
-            context.stroke(Path(ellipseIn: rect), with: .color(mode == .partition ? palette.line : palette.background), lineWidth: 2)
+            context.fill(Path(ellipseIn: rect), with: .color(palette.vertex))
+            context.stroke(Path(ellipseIn: rect), with: .color(palette.background), lineWidth: 2)
+            if mode == .basic {
+                // Letter the corners so the pivot explanation can name them.
+                let label = Text(vertexName(index))
+                    .font(.footnote.bold())
+                    .foregroundStyle(palette.line)
+                context.draw(label, at: CGPoint(x: point.x + radius + 9, y: point.y - radius - 6))
+            }
         }
     }
 
@@ -2203,17 +2583,27 @@ struct ContentView: View {
                 context.fill(Path(ellipseIn: head), with: .color(palette.line))
             }
 
-            // Witness marker: an ✕ at the final iterate of a non-converged trajectory.
-            if fullyRevealed && !trajectory.converged, let last = points.last {
-                if showBisector, let p = queryPoint {
-                    drawBisector(between: last, and: p, in: &context)
+            // Witness marker: an ✕ at the final iterate proving p is outside.
+            // A trace that merely ran out of iterations proves nothing, so it
+            // ends in an open ring instead — and never claims a bisector.
+            if fullyRevealed, let last = points.last {
+                switch trajectory.outcome {
+                case .witness:
+                    if showBisector, let p = queryPoint {
+                        drawBisector(between: last, and: p, in: &context)
+                    }
+                    var cross = Path()
+                    cross.move(to: CGPoint(x: last.x - 6, y: last.y - 6))
+                    cross.addLine(to: CGPoint(x: last.x + 6, y: last.y + 6))
+                    cross.move(to: CGPoint(x: last.x + 6, y: last.y - 6))
+                    cross.addLine(to: CGPoint(x: last.x - 6, y: last.y + 6))
+                    context.stroke(cross, with: .color(palette.line), lineWidth: 3)
+                case .exhausted:
+                    let ring = CGRect(x: last.x - 5, y: last.y - 5, width: 10, height: 10)
+                    context.stroke(Path(ellipseIn: ring), with: .color(palette.line), lineWidth: 2.5)
+                case .converged:
+                    break
                 }
-                var cross = Path()
-                cross.move(to: CGPoint(x: last.x - 6, y: last.y - 6))
-                cross.addLine(to: CGPoint(x: last.x + 6, y: last.y + 6))
-                cross.move(to: CGPoint(x: last.x + 6, y: last.y - 6))
-                cross.addLine(to: CGPoint(x: last.x - 6, y: last.y + 6))
-                context.stroke(cross, with: .color(palette.line), lineWidth: 3)
             }
         }
     }

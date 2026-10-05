@@ -1,0 +1,9 @@
+{
+  "id" : "fafe3f2d-f2cc-48b5-afeb-db7bb3d88ce8",
+  "targets" : [
+    {
+      "id" : "7237dcc9-ab14-4174-a85a-0f3d6cd6cb6a",
+      "name" : "TriangleAlgorithm"
+    }
+  ]
+}

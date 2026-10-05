@@ -12,13 +12,26 @@ final class SoundEngine {
         /// gap and 0 is on top of the target.
         let gaps: [Double]
         let converged: Bool
+        /// Whether the voice ends on its chord. Manual stepping plays one
+        /// tick at a time and only resolves on the run's final step.
+        var playsCadence = true
+    }
+
+    /// AVAudioPCMBuffer isn't Sendable; the background render task builds
+    /// the buffer privately and hands it to the main actor exactly once.
+    private struct RenderedScore: @unchecked Sendable {
+        let buffer: AVAudioPCMBuffer
     }
 
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
-    private let sampleRate: Double = 44_100
-    /// Never synthesize more than this much audio for one run.
-    private let maxScoreDuration: Double = 30
+    nonisolated private static let sampleRate: Double = 44_100
+    /// Never synthesize more than this much audio for one run. The run
+    /// animation clamps to the same bound so picture and score end together.
+    nonisolated static let maxScoreDuration: Double = 30
+    /// Invalidates in-flight background renders when a newer run (or a stop)
+    /// supersedes them.
+    private var renderGeneration = 0
     private var isReady = false
     private var isPreparing = false
     /// Score waiting for the session to finish activating; the first run's
@@ -38,16 +51,27 @@ final class SoundEngine {
     }
 
     private func playRendered(voices: [Voice], stepsPerSecond: Double) {
-        guard let buffer = renderScore(voices: voices, stepsPerSecond: stepsPerSecond) else { return }
-        if isReady {
-            playNow(buffer)
-        } else {
-            pendingBuffer = buffer
-            prepareIfNeeded()
+        renderGeneration += 1
+        let generation = renderGeneration
+        // Synthesis is tens of millions of float ops for a busy run — far
+        // too much for the main actor at the exact moment the run animation
+        // starts, so it renders on a background task.
+        Task {
+            let score = await Task.detached(priority: .userInitiated) {
+                Self.renderScore(voices: voices, stepsPerSecond: stepsPerSecond).map(RenderedScore.init)
+            }.value
+            guard generation == renderGeneration, let score else { return }
+            if isReady {
+                playNow(score.buffer)
+            } else {
+                pendingBuffer = score.buffer
+                prepareIfNeeded()
+            }
         }
     }
 
     func stop() {
+        renderGeneration += 1
         pendingBuffer = nil
         guard isReady else { return }
         player.stop()
@@ -94,7 +118,7 @@ final class SoundEngine {
             engine.connect(
                 player,
                 to: engine.mainMixerNode,
-                format: AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1)
+                format: AVAudioFormat(standardFormatWithSampleRate: Self.sampleRate, channels: 1)
             )
             try engine.start()
             isReady = true
@@ -110,7 +134,8 @@ final class SoundEngine {
 
     /// Renders the whole run into a single PCM buffer, offline, so playback
     /// stays perfectly in step with the on-screen animation timing.
-    private func renderScore(voices: [Voice], stepsPerSecond: Double) -> AVAudioPCMBuffer? {
+    /// Pure computation with no engine state, so it runs off the main actor.
+    nonisolated private static func renderScore(voices: [Voice], stepsPerSecond: Double) -> AVAudioPCMBuffer? {
         let stepDuration = 1.0 / stepsPerSecond
         let maxSteps = voices.map(\.gaps.count).max() ?? 0
         guard maxSteps > 0 else { return nil }
@@ -149,6 +174,7 @@ final class SoundEngine {
                 addTone(at: time, frequency: frequency, duration: 0.09, amplitude: 0.035)
             }
 
+            guard voice.playsCadence else { continue }
             let endTime = Double(voice.gaps.count - 1) * stepDuration + offset
             if voice.converged {
                 for frequency in [523.25, 659.25, 784.0] {   // C–E–G: resolved

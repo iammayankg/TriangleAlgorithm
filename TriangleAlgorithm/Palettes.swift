@@ -1,5 +1,64 @@
 import SwiftUI
+#if canImport(UIKit)
 import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
+
+// MARK: - Platform bridging
+
+#if canImport(UIKit)
+/// The native color and image types for the current platform.
+typealias PlatformColor = UIColor
+typealias PlatformImage = UIImage
+#elseif canImport(AppKit)
+typealias PlatformColor = NSColor
+typealias PlatformImage = NSImage
+#endif
+
+extension PlatformColor {
+    /// The color's sRGB components. AppKit colors can live in non-RGB
+    /// color spaces (and `getRed` traps there), so they are converted first.
+    var rgbaComponents: (red: CGFloat, green: CGFloat, blue: CGFloat, alpha: CGFloat) {
+        var red: CGFloat = 0, green: CGFloat = 0, blue: CGFloat = 0, alpha: CGFloat = 0
+#if canImport(UIKit)
+        getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+#else
+        (usingColorSpace(.sRGB) ?? self).getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+#endif
+        return (red, green, blue, alpha)
+    }
+}
+
+extension View {
+    /// Inline navigation titles exist only on iOS; macOS has no such option.
+    @ViewBuilder func inlineNavigationTitle() -> some View {
+#if os(iOS)
+        navigationBarTitleDisplayMode(.inline)
+#else
+        self
+#endif
+    }
+
+    /// Medium/large sheet detents are an iOS concept; macOS sheets size to fit.
+    @ViewBuilder func mediumOrLargeDetents() -> some View {
+#if os(iOS)
+        presentationDetents([.medium, .large])
+#else
+        self
+#endif
+    }
+
+    /// Keeps a popover a popover on compact iPhone layouts. macOS popovers
+    /// never adapt, so there is nothing to override there.
+    @ViewBuilder func keepPopoverCompact() -> some View {
+#if os(iOS)
+        presentationCompactAdaptation(.popover)
+#else
+        self
+#endif
+    }
+}
 
 // MARK: - Palettes
 
@@ -212,8 +271,7 @@ extension Color {
     }
 
     var hexString: String {
-        var red: CGFloat = 0, green: CGFloat = 0, blue: CGFloat = 0, alpha: CGFloat = 0
-        UIColor(self).getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+        let (red, green, blue, _) = PlatformColor(self).rgbaComponents
         func byte(_ component: CGFloat) -> Int { Int((max(0, min(1, component)) * 255).rounded()) }
         return String(format: "#%02X%02X%02X", byte(red), byte(green), byte(blue))
     }
@@ -247,14 +305,14 @@ struct CustomPaletteEditor: View {
                 }
             }
             .navigationTitle("Custom palette")
-            .navigationBarTitleDisplayMode(.inline)
+            .inlineNavigationTitle()
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
                 }
             }
         }
-        .presentationDetents([.medium, .large])
+        .mediumOrLargeDetents()
     }
 
     private func colorRow(_ title: String, _ keyPath: WritableKeyPath<CustomPaletteData, String>) -> some View {

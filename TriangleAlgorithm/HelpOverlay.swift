@@ -23,13 +23,15 @@ struct HelpOverlay: View {
                             .frame(maxWidth: .infinity, alignment: .center)
 
                         row(icon: "square.grid.2x2", title: "Pick a mode",
-                            detail: "Basic traces one path in a triangle, slowly, pointing out each pivot vertex. Paths traces many starting iterates at once. Regions fills the areas between paths with a palette. Partition colors every point of the hull by the vertex it pivots to first.")
+                            detail: "Basic traces one path in a triangle, slowly, pointing out each pivot vertex. Paths traces many starting iterates at once. Regions fills the areas between paths with a palette. Partition colors the intensity of each point inside the hull based on the number of iterations it took.")
                         row(icon: "hand.tap", title: "Build a hull",
                             detail: "Tap the canvas to drop points — you need at least three. Drag any dot to reshape the hull; the buttons below undo or clear.")
                         row(icon: "circlebadge.fill", title: "Place the target",
                             detail: "Drag the dot anywhere on the canvas. The app tests whether that point lies inside the hull.")
                         row(icon: "play.fill", title: "Run",
-                            detail: "Trajectories trace toward the target with sound. Converging paths mean the point is inside; a ✕ marks a witness proving it's outside. Stop skips to the result.")
+                            detail: "Trajectories trace toward the target with sound. Converging paths mean the point is inside; a ✕ marks a witness proving it's outside. Stop skips to the result. In Basic mode, switch Auto to Step to take the trace one pivot at a time with Next and Back.")
+                        row(icon: "arrow.left.arrow.right", title: "Fight the zig-zag",
+                            detail: "Near a facet the classic step bounces between two vertices. The strategy button (and Settings → Algorithm) swaps in the remedies from the paper: the midpoint heuristic, away steps, pairwise MDM transfers, or guarded block transfers with k pairs. In Basic mode a struck-through ring marks a vertex the iterate moves away from, a small card above the controls explains why each pivot was chosen (page through the steps once the trace ends), and the status chip counts each kind of step.")
                         row(icon: "paintpalette", title: "Style it",
                             detail: "Settings (under ⋯) holds the art themes and a customizable palette — each sets the line and accent colors, and restyles the finished picture instantly, no re-run needed.")
 
