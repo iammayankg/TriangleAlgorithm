@@ -23,15 +23,15 @@ struct HelpOverlay: View {
                             .frame(maxWidth: .infinity, alignment: .center)
 
                         row(icon: "square.grid.2x2", title: "Pick a mode",
-                            detail: "Basic traces one path in a triangle, slowly, pointing out each pivot vertex. Paths traces many starting iterates at once; its coloring button switches between plain paths, palette-filled regions between them, and an iteration-intensity gradient. Partition colors the intensity of each point inside the hull based on the number of iterations it took.")
+                            detail: "Learn traces one path in a triangle, slowly, pointing out each pivot vertex. Studio traces many starting iterates at once; its coloring button switches between plain paths, palette-filled regions between them, and an iteration-intensity gradient over the hull.")
                         row(icon: "hand.tap", title: "Build a hull",
                             detail: "Tap the canvas to drop points — you need at least three. Drag any dot to reshape the hull; the buttons below undo or clear.")
                         row(icon: "circlebadge.fill", title: "Place the target",
                             detail: "Drag the dot anywhere on the canvas. The app tests whether that point lies inside the hull.")
                         row(icon: "play.fill", title: "Run",
-                            detail: "Trajectories trace toward the target with sound. Converging paths mean the point is inside; a ✕ marks a witness proving it's outside. Stop skips to the result. In Basic mode, switch Auto to Step to take the trace one pivot at a time with Next and Back.")
+                            detail: "Trajectories trace toward the target with sound. Converging paths mean the point is inside; a ✕ marks a witness proving it's outside. Stop skips to the result. In Learn mode, switch Auto to Step to take the trace one pivot at a time with Next and Back.")
                         row(icon: "arrow.left.arrow.right", title: "Fight the zig-zag",
-                            detail: "Near a facet the classic step bounces between two vertices. The strategy button (and Settings → Algorithm) swaps in the remedies from the paper: the midpoint heuristic, away steps, pairwise MDM transfers, or guarded block transfers with k pairs. In Basic mode a struck-through ring marks a vertex the iterate moves away from, a small card above the controls explains why each pivot was chosen (page through the steps once the trace ends), and the status chip (Settings → Status chips) counts each kind of step.")
+                            detail: "Near a facet the classic step bounces between two vertices. The strategy button (and Settings → Algorithm) swaps in the remedies from the paper: the midpoint heuristic, away steps, pairwise MDM transfers, or guarded block transfers with k pairs. In Learn mode a struck-through ring marks a vertex the iterate moves away from, a small card above the controls explains why each pivot was chosen (page through the steps once the trace ends), and the status chip (Settings → Status chips) counts each kind of step.")
                         row(icon: "paintpalette", title: "Style it",
                             detail: "Settings (under ⋯) holds the art themes and a customizable palette — each sets the line and accent colors, and restyles the finished picture instantly, no re-run needed.")
 
@@ -39,7 +39,7 @@ struct HelpOverlay: View {
                             .padding(.leading, 46)
 
                         row(icon: "square.stack.3d.up", title: "How the paint is applied",
-                            detail: "The coloring button in Paths mode picks the look. Plain paths shows the bare trajectories. Palette slices fills the regions between neighboring trajectories with the theme's colors — neutral tones first, accents layered on top where paths cross. Iteration intensity turns the hull into a gradient: the algorithm runs from thousands of interior points, and the theme's accent color deepens where more steps are needed.")
+                            detail: "The coloring button in Studio mode picks the look. Plain paths shows the bare trajectories. Palette slices fills the regions between neighboring trajectories with the theme's colors — neutral tones first, accents layered on top where paths cross. Iteration intensity turns the hull into a gradient: the algorithm runs from thousands of interior points, and the theme's accent color deepens where more steps are needed.")
                         row(icon: "square.grid.3x3.topleft.filled", title: "Shape the iterates",
                             detail: "With Plain paths or Palette slices, choose how the starting iterates are laid out — border, ring, spiral, random — or edit them by hand. They always live inside the hull. Iteration intensity samples its own grid instead.")
                         row(icon: "sparkles", title: "And more",

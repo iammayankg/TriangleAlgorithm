@@ -40,13 +40,48 @@ extension View {
 #endif
     }
 
-    /// Medium/large sheet detents are an iOS concept; macOS sheets size to fit.
+    /// Medium/large sheet detents are an iOS concept. macOS sheets size to
+    /// their content, and a Form's content size is tiny, so the Mac gets an
+    /// explicit frame instead.
     @ViewBuilder func mediumOrLargeDetents() -> some View {
 #if os(iOS)
         presentationDetents([.medium, .large])
 #else
-        self
+        frame(minWidth: 480, idealWidth: 520, minHeight: 520, idealHeight: 640)
 #endif
+    }
+
+    /// A Menu's label as a glass capsule, matching the glass buttons beside
+    /// it. `.buttonStyle(.glass)` does that on iOS, but on macOS it leaves
+    /// the menu invisible (as do the button and bordered menu styles), so
+    /// the Mac draws a borderless menu inside a hand-built capsule.
+    ///
+    /// Inside a window toolbar the toolbar supplies the chrome, so
+    /// `inToolbar` leaves the menu unstyled.
+    @ViewBuilder func glassMenuButton(inToolbar: Bool = false) -> some View {
+        if inToolbar {
+            self
+        } else {
+#if os(iOS)
+            buttonStyle(.glass)
+#else
+            menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .padding(.horizontal, 13)
+                .padding(.vertical, 7)
+                .glassEffect()
+#endif
+        }
+    }
+
+    /// A glass button in the floating bars; unstyled inside a window
+    /// toolbar, which provides its own chrome.
+    @ViewBuilder func glassButton(inToolbar: Bool = false) -> some View {
+        if inToolbar {
+            self
+        } else {
+            buttonStyle(.glass)
+        }
     }
 
     /// Keeps a popover a popover on compact iPhone layouts. macOS popovers
@@ -338,4 +373,8 @@ struct CustomPaletteEditor: View {
             set: { data.slices[index] = $0.hexString }
         )
     }
+}
+
+#Preview("Palette editor") {
+    CustomPaletteEditor(data: .constant(.initial))
 }

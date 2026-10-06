@@ -5,7 +5,106 @@ import Photos
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .macWindowFrame()
         }
+        .macDefaultSize()
+        .commands {
+            TraceMenuCommands()
+        }
+    }
+}
+
+// MARK: - Menu bar commands
+
+/// The actions the menu bar can trigger on the frontmost canvas. The
+/// canvas publishes these through the focused scene so the commands
+/// stay in sync with its state (Run vs. Stop, what can be undone).
+struct TraceCommands {
+    var runTitle: String
+    var runEnabled: Bool
+    var run: () -> Void
+    var undoEnabled: Bool
+    var undo: () -> Void
+    var clearEnabled: Bool
+    var clearAll: () -> Void
+    var randomExample: () -> Void
+    var ambient: () -> Void
+    var openSettings: () -> Void
+    var openHelp: () -> Void
+}
+
+struct TraceCommandsKey: FocusedValueKey {
+    typealias Value = TraceCommands
+}
+
+extension FocusedValues {
+    var traceCommands: TraceCommands? {
+        get { self[TraceCommandsKey.self] }
+        set { self[TraceCommandsKey.self] = newValue }
+    }
+}
+
+/// Menu bar items with the shortcuts a Mac (or iPad with a keyboard)
+/// user expects: Run/Stop, Undo, Clear, Settings, and Help.
+struct TraceMenuCommands: Commands {
+    @FocusedValue(\.traceCommands) private var commands
+
+    var body: some Commands {
+        CommandGroup(replacing: .appSettings) {
+            Button("Settings…") { commands?.openSettings() }
+                .keyboardShortcut(",")
+                .disabled(commands == nil)
+        }
+        // The canvas has its own notion of undo (the last placed point);
+        // the stock Undo/Redo items would be dead, so the Trace menu
+        // takes over the shortcut.
+        CommandGroup(replacing: .undoRedo) { }
+        CommandMenu("Trace") {
+            Button(commands?.runTitle ?? "Run") { commands?.run() }
+                .keyboardShortcut("r")
+                .disabled(commands?.runEnabled != true)
+            Button("Random Example") { commands?.randomExample() }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+                .disabled(commands == nil)
+            Divider()
+            Button("Undo Last Point") { commands?.undo() }
+                .keyboardShortcut("z")
+                .disabled(commands?.undoEnabled != true)
+            Button("Clear All Points") { commands?.clearAll() }
+                .keyboardShortcut(.delete)
+                .disabled(commands?.clearEnabled != true)
+            Divider()
+            Button("Ambient Mode") { commands?.ambient() }
+                .disabled(commands == nil)
+        }
+        CommandGroup(replacing: .help) {
+            Button("TriangleTrace Help") { commands?.openHelp() }
+                .keyboardShortcut("?")
+                .disabled(commands == nil)
+        }
+    }
+}
+
+extension Scene {
+    /// A roomy first window on the Mac; iOS windows fill the screen anyway.
+    @SceneBuilder func macDefaultSize() -> some Scene {
+#if os(macOS)
+        defaultSize(width: 1000, height: 760)
+#else
+        self
+#endif
+    }
+}
+
+extension View {
+    /// Keeps the Mac window large enough for the mode picker, the control
+    /// bar, and a usable canvas; a no-op on iOS.
+    @ViewBuilder func macWindowFrame() -> some View {
+#if os(macOS)
+        frame(minWidth: 680, minHeight: 600)
+#else
+        self
+#endif
     }
 }
 
@@ -243,6 +342,21 @@ struct ContentView: View {
         case partition = "Partition"
 
         var id: String { rawValue }
+
+        /// What the picker and tutorials call the mode. The raw values stay
+        /// as they were so saved preferences keep decoding.
+        var title: String {
+            switch self {
+            case .basic: "Learn"
+            case .paths: "Studio"
+            case .partition: "Partition"
+            }
+        }
+
+        /// The modes offered in the picker and the tutorials menu. Partition
+        /// is hidden for now: Paths' iteration-intensity coloring shows the
+        /// same picture, so the extra tab only duplicated it.
+        static let visible: [AppMode] = [.basic, .paths]
     }
 
     enum DragTarget: Hashable {
@@ -354,9 +468,9 @@ struct ContentView: View {
                     ? "Now drag p inside the triangle and press Run again — this time the iterate should reach it."
                     : "Now drag p outside the triangle and press Run again — with no valid pivot left, the iterate stops as a ✕ witness."
             case .explore:
-                "That's the whole algorithm! Explore the modes up top: Paths traces many starts at once, with a coloring button that paints the areas between them, and Partition shades the hull by how many iterations each point needs. Each has its own tutorial under the ⋯ menu."
+                "That's the whole algorithm! Switch to Studio up top: it traces many starts at once, and its coloring button paints the areas between them or shades the whole hull by how many iterations each point needs. The Studio tutorial is under the ⋯ menu."
             case .pathsLoadShape:
-                "Paths traces a whole set of starting iterates at once. Load a point set from the shape menu below — Circle is a good start — or tap points by hand and press Run."
+                "Studio traces a whole set of starting iterates at once. Load a point set from the shape menu below — Circle is a good start — or tap points by hand and press Run."
             case .pathsWatch:
                 "Every small square is a starting iterate. They all walk toward p at the same time, each picking its own pivots along the way."
             case .pathsSchemes:
@@ -368,7 +482,7 @@ struct ContentView: View {
             case .regionsPaint:
                 "Now paint by hand: tap the paintbrush at the top left, pick a color from the wheel, then tap any wedge to recolor it."
             case .regionsThemes:
-                "Nice! The coloring button also offers Iteration intensity, a gradient over the hull. Themes and a custom palette live under ⋯ → Settings, and the share button exports the picture as a poster. Last stop: the Partition tutorial, under ⋯."
+                "Nice! The coloring button also offers Iteration intensity: the hull becomes a gradient, deeper where the algorithm needs more steps. Themes and a custom palette live under ⋯ → Settings, and the share button exports the picture as a poster. That's the full tour — replay any tutorial from the ⋯ menu."
             case .partitionRun:
                 "Partition answers one question: starting from each point inside the hull, how many iterations does the algorithm need to reach p? Load a shape from the menu below or tap your own points, then press Run."
             case .partitionRead:
@@ -605,6 +719,12 @@ struct ContentView: View {
                 mode = .paths
                 coloringMode = .palette
             }
+            // Partition is hidden from the picker; a saved Partition mode
+            // lands on its Paths equivalent, the iteration-intensity coloring.
+            if !AppMode.visible.contains(mode) {
+                mode = .paths
+                coloringMode = .intensity
+            }
             // The mode and coloring persist across launches but the scheme
             // doesn't: restore the coloring's default when launching into Paths.
             if mode == .paths, let scheme = defaultScheme(for: coloringMode) {
@@ -828,7 +948,60 @@ struct ContentView: View {
         .sheet(isPresented: $showSettings) {
             settingsSheet
         }
+        .focusedSceneValue(\.traceCommands, traceCommands)
+#if os(macOS)
+        .toolbar { macToolbar }
+#endif
     }
+
+    /// What the menu bar can do right now, republished on every change.
+    private var traceCommands: TraceCommands {
+        TraceCommands(
+            runTitle: isAnimating || isBuildingField ? "Stop" : hasResult ? "Replay" : "Run",
+            runEnabled: isAnimating || isBuildingField || !runDisabled,
+            run: runOrStop,
+            undoEnabled: isEditingIterates ? !startPoints.isEmpty : !hullPoints.isEmpty,
+            undo: undo,
+            clearEnabled: !hullPoints.isEmpty || hasRun,
+            clearAll: clearAll,
+            randomExample: randomExample,
+            ambient: {
+                tutorialStep = nil
+                isAmbient = true
+            },
+            openSettings: { showSettings = true },
+            openHelp: { showHelp = true }
+        )
+    }
+
+#if os(macOS)
+    /// On the Mac the primary controls live in the window toolbar, as in
+    /// any document-style app: the mode picker in the center, the per-run
+    /// menus leading, share and info trailing. The canvas keeps only the
+    /// result pill and status chips as floating overlays.
+    @ToolbarContentBuilder
+    private var macToolbar: some ToolbarContent {
+        ToolbarItem(placement: .principal) {
+            modePicker(inToolbar: true)
+        }
+        ToolbarItemGroup(placement: .navigation) {
+            if mode == .paths && coloringMode != .intensity {
+                iterateMenu(inToolbar: true)
+            }
+            if mode == .paths {
+                coloringMenu(inToolbar: true)
+            }
+            strategyMenu(inToolbar: true)
+            if mode == .paths && coloringMode == .palette && hasRun {
+                paintButton(inToolbar: true)
+            }
+        }
+        ToolbarItemGroup(placement: .primaryAction) {
+            shareButton(inToolbar: true)
+            infoButton(inToolbar: true)
+        }
+    }
+#endif
 
     /// App settings. Edits apply immediately, so the canvas behind the
     /// sheet previews new colors and iterate layouts live.
@@ -889,7 +1062,7 @@ struct ContentView: View {
                 } header: {
                     Text("Trace")
                 } footer: {
-                    Text("Status chips show the membership verdict with its iteration count, Basic mode's step summary, and progress while tracing or building a field. Each can also be hidden with its ×.")
+                    Text("Status chips show the membership verdict with its iteration count, Learn mode's step summary, and progress while tracing or building a field. Each can also be hidden with its ×.")
                 }
                 Section {
                     VStack(alignment: .leading) {
@@ -989,28 +1162,35 @@ struct ContentView: View {
 
     private var topOverlay: some View {
         VStack(spacing: 10) {
-            modePicker
+            // On the Mac these controls sit in the window toolbar instead.
+#if !os(macOS)
+            modePicker()
+#endif
             HStack(alignment: .top, spacing: 10) {
+#if !os(macOS)
                 // The iterate set only matters where many paths are traced:
                 // basic has a single fixed start, partition ignores starts,
                 // and the intensity plot samples its own grid.
                 if mode == .paths && coloringMode != .intensity {
-                    iterateMenu
+                    iterateMenu()
                 }
                 // The coloring button toggles how a Paths run is shown.
                 if mode == .paths {
-                    coloringMenu
+                    coloringMenu()
                 }
                 // The step rule shapes every trace, including the iteration
                 // counts behind the partition shading.
-                strategyMenu
+                strategyMenu()
                 if mode == .paths && coloringMode == .palette && hasRun {
-                    paintButton
+                    paintButton()
                 }
+#endif
                 Spacer()
                 resultDot
-                shareButton
-                infoButton
+#if !os(macOS)
+                shareButton()
+                infoButton()
+#endif
             }
             // The chip gets its own row so its text never fights the
             // buttons for width on small screens.
@@ -1045,16 +1225,25 @@ struct ContentView: View {
 
     /// The feature tiers, from the single demonstrated path to the full
     /// canvas. Switching keeps the points but clears the finished picture.
-    private var modePicker: some View {
-        Picker("Mode", selection: $mode) {
-            ForEach(AppMode.allCases) { mode in
-                Text(mode.rawValue).tag(mode)
+    @ViewBuilder
+    private func modePicker(inToolbar: Bool = false) -> some View {
+        let picker = Picker("Mode", selection: $mode) {
+            ForEach(AppMode.visible) { mode in
+                Text(mode.title).tag(mode)
             }
         }
         .pickerStyle(.segmented)
-        .frame(maxWidth: 420)
-        .padding(4)
-        .glassEffect(in: .rect(cornerRadius: 12))
+        // macOS draws a picker's label beside the segments; the segments
+        // speak for themselves here.
+        .labelsHidden()
+        if inToolbar {
+            picker.frame(width: 240)
+        } else {
+            picker
+                .frame(maxWidth: 420)
+                .padding(4)
+                .glassEffect(in: .rect(cornerRadius: 12))
+        }
     }
 
     private var fieldProgressChip: some View {
@@ -1116,14 +1305,14 @@ struct ContentView: View {
 
     /// Enters wedge-painting mode, where a tap fills the wedge under the
     /// finger with the chosen color, layered over the palette's coloring.
-    private var paintButton: some View {
+    private func paintButton(inToolbar: Bool = false) -> some View {
         Button {
             isPaintingWedges.toggle()
             if isPaintingWedges { isEditingIterates = false }
         } label: {
             Image(systemName: isPaintingWedges ? "paintbrush.fill" : "paintbrush")
         }
-        .buttonStyle(.glass)
+        .glassButton(inToolbar: inToolbar)
         .accessibilityLabel(isPaintingWedges ? "Stop painting wedges" : "Paint wedges")
     }
 
@@ -1377,7 +1566,7 @@ struct ContentView: View {
         return counts.count > 1 ? "\(head): \(counts.joined(separator: ", "))" : head
     }
 
-    private var iterateMenu: some View {
+    private func iterateMenu(inToolbar: Bool = false) -> some View {
         Menu {
             Picker("Iterates", selection: $iterateScheme) {
                 Section("Deterministic") {
@@ -1400,14 +1589,14 @@ struct ContentView: View {
         } label: {
             Image(systemName: "square.grid.3x3.topleft.filled")
         }
-        .buttonStyle(.glass)
+        .glassMenuButton(inToolbar: inToolbar)
         .accessibilityLabel("Iterate scheme")
     }
 
     /// Picks how a finished Paths run is shown: the bare trajectories, the
     /// palette-filled regions between them, or the iteration-intensity
     /// field. The same choice lives under Settings.
-    private var coloringMenu: some View {
+    private func coloringMenu(inToolbar: Bool = false) -> some View {
         Menu {
             Picker("Coloring", selection: $coloringMode) {
                 ForEach(ColoringMode.allCases) { coloring in
@@ -1417,13 +1606,13 @@ struct ContentView: View {
         } label: {
             Image(systemName: coloringMode.symbol)
         }
-        .buttonStyle(.glass)
+        .glassMenuButton(inToolbar: inToolbar)
         .accessibilityLabel("Coloring: \(coloringMode.rawValue)")
     }
 
     /// Quick access to the anti-zig-zag step strategies from the paper; the
     /// same choice, with a fuller description, lives under Settings.
-    private var strategyMenu: some View {
+    private func strategyMenu(inToolbar: Bool = false) -> some View {
         Menu {
             Picker("Step strategy", selection: $stepStrategy) {
                 ForEach(StepStrategy.allCases) { strategy in
@@ -1442,7 +1631,7 @@ struct ContentView: View {
         } label: {
             Image(systemName: stepStrategy.symbol)
         }
-        .buttonStyle(.glass)
+        .glassMenuButton(inToolbar: inToolbar)
         .accessibilityLabel("Step strategy: \(stepStrategy.name)")
     }
 
@@ -1462,7 +1651,7 @@ struct ContentView: View {
         )
     }
 
-    private var shareButton: some View {
+    private func shareButton(inToolbar: Bool = false) -> some View {
         Button(action: sharePoster) {
             if isRenderingPoster {
                 ProgressView()
@@ -1470,18 +1659,18 @@ struct ContentView: View {
                 Image(systemName: "square.and.arrow.up")
             }
         }
-        .buttonStyle(.glass)
+        .glassButton(inToolbar: inToolbar)
         .disabled(!hasResult || isAnimating || isRenderingPoster)
         .accessibilityLabel(isRenderingPoster ? "Rendering poster" : "Export poster")
     }
 
-    private var infoButton: some View {
+    private func infoButton(inToolbar: Bool = false) -> some View {
         Button {
             showInfo.toggle()
         } label: {
             Image(systemName: "info")
         }
-        .buttonStyle(.glass)
+        .glassButton(inToolbar: inToolbar)
         .accessibilityLabel("About the Triangle Algorithm")
         .popover(isPresented: $showInfo) {
             infoContent
@@ -1559,7 +1748,7 @@ struct ContentView: View {
     private func tutorialCard(_ step: TutorialStep) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Label("\(step.flow.rawValue) tutorial", systemImage: "graduationcap.fill")
+                Label("\(step.flow.title) tutorial", systemImage: "graduationcap.fill")
                     .font(.caption.bold())
                 Spacer()
                 Text("\(step.indexInFlow + 1) of \(step.flowLength)")
@@ -1602,6 +1791,41 @@ struct ContentView: View {
         }
     }
 
+    /// Basic mode's stepping style: let the trace play, or take it one
+    /// step per tap. Segmented on iOS; on macOS a segmented picker inside
+    /// the glass control bar collapses to a single segment, so the Mac
+    /// gets a glass pop-up menu instead.
+    private var steppingPicker: some View {
+        let picker = Picker("Stepping", selection: $manualStepping) {
+            Text("Auto").tag(false)
+            Text("Step").tag(true)
+        }
+        .labelsHidden()
+        .accessibilityLabel("Stepping style")
+#if os(macOS)
+        return picker
+            .pickerStyle(.menu)
+            .fixedSize()
+            .glassEffect()
+#else
+        return picker
+            .pickerStyle(.segmented)
+            .frame(width: 130)
+#endif
+    }
+
+    /// The Run button's action, shared with the menu bar: stop whatever is
+    /// in flight, otherwise start a run.
+    private func runOrStop() {
+        if isAnimating {
+            stopTrace()
+        } else if isBuildingField {
+            cancelFieldBuild()
+        } else {
+            recompute(animated: true)
+        }
+    }
+
     private var controlBar: some View {
         GlassEffectContainer(spacing: 14) {
             HStack(spacing: 14) {
@@ -1609,15 +1833,7 @@ struct ContentView: View {
                 // Stop, so a long run can always be interrupted even with
                 // the status chips hidden.
                 let busy = isAnimating || isBuildingField
-                Button {
-                    if isAnimating {
-                        stopTrace()
-                    } else if isBuildingField {
-                        cancelFieldBuild()
-                    } else {
-                        recompute(animated: true)
-                    }
-                } label: {
+                Button(action: runOrStop) {
                     Label(busy ? "Stop" : hasResult ? "Replay" : "Run",
                           systemImage: busy ? "stop.fill" : hasResult ? "arrow.clockwise" : "play.fill")
                         .frame(minWidth: 90)
@@ -1629,13 +1845,7 @@ struct ContentView: View {
                 // belong to the richer tiers. It gets the stepping style
                 // instead: let the trace play, or take it one step per tap.
                 if mode == .basic {
-                    Picker("Stepping", selection: $manualStepping) {
-                        Text("Auto").tag(false)
-                        Text("Step").tag(true)
-                    }
-                    .pickerStyle(.segmented)
-                    .frame(width: 130)
-                    .accessibilityLabel("Stepping style")
+                    steppingPicker
                 } else {
                     shapeMenu
                 }
@@ -1670,7 +1880,7 @@ struct ContentView: View {
         } label: {
             Image(systemName: "square.on.circle")
         }
-        .buttonStyle(.glass)
+        .glassMenuButton()
         .accessibilityLabel("Shape presets")
     }
 
@@ -1688,8 +1898,8 @@ struct ContentView: View {
             }
             Divider()
             Menu {
-                ForEach(AppMode.allCases) { flowMode in
-                    Button(flowMode.rawValue) {
+                ForEach(AppMode.visible) { flowMode in
+                    Button(flowMode.title) {
                         startTutorial(for: flowMode)
                     }
                 }
@@ -1709,7 +1919,7 @@ struct ContentView: View {
         } label: {
             Image(systemName: "ellipsis")
         }
-        .buttonStyle(.glass)
+        .glassMenuButton()
         .accessibilityLabel("More options")
     }
 
@@ -2422,6 +2632,7 @@ struct ContentView: View {
                     }
                 }
                 .pickerStyle(.segmented)
+                .labelsHidden()
                 Text("\(Int(poster.pixelSize.width)) × \(Int(poster.pixelSize.height)) px")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -2521,6 +2732,7 @@ struct ContentView: View {
         switch mode {
         case .basic:
             drawTrajectories(in: &context, upTo: progress)
+            drawAddedPivots(in: &context, upTo: progress)
             drawPivotDemo(in: &context, upTo: progress)
         case .paths:
             // The intensity field speaks for itself; trajectory polylines
@@ -2547,6 +2759,38 @@ struct ContentView: View {
     /// that points at no vertex at all (a pairwise or block transfer), so
     /// the demo draws the search segment itself, rings the receivers, and
     /// marks donors with a struck-through ring.
+    /// The pivot points the midpoint heuristic added during Basic mode's
+    /// trace: a diamond at each, lettered M1, M2… like the corners, shown
+    /// from the step that added it onward so the pivot set visibly grows.
+    private func drawAddedPivots(in context: inout GraphicsContext, upTo progress: Double) {
+        guard let trajectory = trajectories.first else { return }
+        let r: CGFloat = pointMarkerSize * 0.75
+        for (index, step) in trajectory.steps.enumerated() {
+            guard let added = step.addedPivot, Double(index) <= progress else { continue }
+            let m = added.point
+            // A faint tie to both parents says what the point is the midpoint of.
+            var ties = Path()
+            for parent in added.parents {
+                ties.move(to: m)
+                ties.addLine(to: parent)
+            }
+            context.stroke(ties, with: .color(palette.target.opacity(0.35)),
+                           style: StrokeStyle(lineWidth: 1, dash: [2, 4]))
+            var diamond = Path()
+            diamond.move(to: CGPoint(x: m.x, y: m.y - r))
+            diamond.addLine(to: CGPoint(x: m.x + r, y: m.y))
+            diamond.addLine(to: CGPoint(x: m.x, y: m.y + r))
+            diamond.addLine(to: CGPoint(x: m.x - r, y: m.y))
+            diamond.closeSubpath()
+            context.fill(diamond, with: .color(palette.target))
+            context.stroke(diamond, with: .color(palette.background), lineWidth: 1.5)
+            let label = Text(added.name)
+                .font(.footnote.bold())
+                .foregroundStyle(palette.line)
+            context.draw(label, at: CGPoint(x: m.x + r + 9, y: m.y - r - 6))
+        }
+    }
+
     private func drawPivotDemo(in context: inout GraphicsContext, upTo progress: Double) {
         guard let trajectory = trajectories.first, !trajectory.steps.isEmpty else { return }
         let points = trajectory.points

@@ -12,7 +12,9 @@ import SwiftUI
 nonisolated enum StepStrategy: String, CaseIterable, Identifiable {
     /// Plain Triangle Algorithm: move toward the best valid pivot.
     case toward = "Toward"
-    /// Pivot on the midpoint of the two best pivots when that lands nearer p.
+    /// The enhanced TA's anti-zig-zag heuristic (Gupta & Kalantari, §6.3):
+    /// when a step shrinks the gap by less than ε of the gap, add the
+    /// midpoint of the two most frequently used pivots as an extra pivot.
     case midpoint = "Midpoint"
     /// Away-step Frank–Wolfe: a step straight away from the worst active
     /// vertex competes with the toward step.
@@ -52,7 +54,7 @@ nonisolated enum StepStrategy: String, CaseIterable, Identifiable {
         case .toward:
             "The plain Triangle Algorithm. Each step picks the vertex v with d(x, v) ≥ d(p, v) whose segment brings the iterate nearest to p and moves there. Near a facet this zig-zags between two vertices."
         case .midpoint:
-            "The search heuristic of the enhanced TA: besides the best pivot, try pivoting on the midpoint of the two best pivots. Blending two vertices aims straight at a facet instead of bouncing between its corners."
+            "The anti-zig-zag heuristic of the enhanced TA. A step that shrinks the gap by less than \(Int(StepSolver.zigZagTolerance * 100))% of the gap signals zig-zagging, so the midpoint of the two most frequently used pivots is added to the pivot set. Pivoting on it aims straight at the facet instead of bouncing between its corners."
         case .away:
             "Away-step Frank–Wolfe. The iterate is kept as a weighted blend of vertices; a step directly away from the worst-weighted vertex competes with the toward step. When the away step empties a vertex's weight it is a drop step."
         case .pairwise:
@@ -114,9 +116,21 @@ nonisolated struct TraceStep {
     /// Why this step was chosen over the alternatives the strategy weighed,
     /// in a sentence or two naming vertices by `vertexName`.
     let reason: String
+    /// A pivot point the midpoint heuristic added to the pivot set on this
+    /// step (whether or not the step then used it), so the canvas can show
+    /// it from the moment it exists.
+    var addedPivot: AddedPivot? = nil
 
     /// The single vertex to call out as "the pivot" of the step.
     var pivot: CGPoint { receivers.first ?? donors.first ?? endpoint }
+}
+
+/// A point the midpoint heuristic added to the pivot set: its label
+/// (M1, M2…), where it sits, and the two pivots it is the midpoint of.
+nonisolated struct AddedPivot {
+    let name: String
+    let point: CGPoint
+    let parents: [CGPoint]
 }
 
 /// Short label for the vertex at `index`: A, B, C… then v27, v28….
@@ -212,6 +226,22 @@ nonisolated struct StepSolver {
     /// Below this a weight counts as zero (the vertex has left the support).
     private static let supportThreshold: CGFloat = 1e-9
 
+    // Midpoint-heuristic state (Gupta & Kalantari §6.3). Only the midpoint
+    // strategy touches these; for the others they stay empty.
+
+    /// ε in the zig-zag test Δd(x, p) < ε·d(x, p): a step that shrinks the
+    /// gap by less than this fraction of the gap counts as zig-zagging.
+    static let zigZagTolerance: CGFloat = 0.1
+    /// Extra pivot points added by the heuristic, each the midpoint of two
+    /// earlier pivots (by pivot index). A midpoint is a convex combination
+    /// of its parents, so the segment to it stays inside the hull.
+    private var extraPivots: [(point: CGPoint, parents: (Int, Int))] = []
+    /// How often each pivot has been chosen, keyed by pivot index: a vertex
+    /// index, or `vertices.count` plus the extra pivot's position.
+    private var pivotUses: [Int: Int] = [:]
+    /// The gap before the previous step, for the zig-zag test.
+    private var previousGap: CGFloat? = nil
+
     init(start: CGPoint, vertices: [CGPoint], target: CGPoint, strategy: StepStrategy, blockSize: Int) {
         self.vertices = vertices
         self.target = target
@@ -235,6 +265,9 @@ nonisolated struct StepSolver {
         let update: WeightUpdate
         /// Filled in wherever the decision between candidates is made.
         var reason = ""
+        /// For toward and midpoint steps, the pivot index stepped toward,
+        /// so the midpoint heuristic can count how often each pivot is used.
+        var pivotIndex: Int? = nil
     }
 
     private enum WeightUpdate {
@@ -249,6 +282,10 @@ nonisolated struct StepSolver {
     /// Takes one step. Nil means the iterate is a witness: no vertex is a
     /// valid Triangle-Algorithm pivot, so p is provably outside the hull.
     mutating func advance() -> TraceStep? {
+        // The midpoint heuristic grows the pivot set before the scan, so a
+        // freshly added midpoint can be chosen on this very step.
+        let addition = strategy == .midpoint ? addMidpointIfZigZagging() : nil
+        let zigZagText = addition?.text
         let scan = towardScan()
         guard let toward = scan.best else { return nil }
         var chosen = toward
@@ -257,16 +294,9 @@ nonisolated struct StepSolver {
         case .toward:
             chosen.reason = towardText
         case .midpoint:
-            if let midpoint = midpointCandidate() {
-                let names = midpoint.receivers.map(vertexName)
-                if midpoint.gain > toward.gain {
-                    chosen = midpoint
-                    chosen.reason = "Pivoting on the midpoint of \(names[0]) and \(names[1]), the two best pivots, lands nearer p than \(names[0]) alone: \(gapText(midpoint)) versus \(gapText(toward))."
-                } else {
-                    chosen.reason = "\(names[0]) alone lands nearer p than the midpoint of \(names[0]) and \(names[1]): \(gapText(toward)) versus \(gapText(midpoint))."
-                }
-            } else {
-                chosen.reason = towardText + " With no second valid pivot there is no midpoint to try."
+            chosen.reason = (zigZagText ?? "") + towardText
+            if toward.kind == .toward, !extraPivots.isEmpty {
+                chosen.reason += " No added midpoint beats it."
             }
         case .away:
             if let away = awayCandidate(), let donor = away.donors.first {
@@ -297,12 +327,68 @@ nonisolated struct StepSolver {
             }
         }
         guard chosen.gain > 0 else { return nil }
+        if strategy == .midpoint {
+            previousGap = gap
+            if let pivot = chosen.pivotIndex { pivotUses[pivot, default: 0] += 1 }
+        }
         apply(chosen)
         return TraceStep(kind: chosen.kind,
-                         receivers: chosen.receivers.map { vertices[$0] },
+                         receivers: chosen.receivers.map(pivotPoint),
                          donors: chosen.donors.map { vertices[$0] },
                          endpoint: chosen.endpoint,
-                         reason: chosen.reason)
+                         reason: chosen.reason,
+                         addedPivot: addition?.pivot)
+    }
+
+    // MARK: Midpoint heuristic
+
+    /// The point of pivot `index`: a vertex, or an added midpoint.
+    private func pivotPoint(_ index: Int) -> CGPoint {
+        index < vertices.count ? vertices[index] : extraPivots[index - vertices.count].point
+    }
+
+    /// A, B, C… for vertices; M1, M2… for added midpoints.
+    private func pivotName(_ index: Int) -> String {
+        index < vertices.count ? vertexName(index) : "M\(index - vertices.count + 1)"
+    }
+
+    /// Pivot `index` expressed over the real vertices: one-hot for a vertex,
+    /// half of each parent's shares for a midpoint.
+    private func vertexShares(of index: Int) -> [(index: Int, share: CGFloat)] {
+        guard index >= vertices.count else { return [(index, 1)] }
+        let (a, b) = extraPivots[index - vertices.count].parents
+        return (vertexShares(of: a) + vertexShares(of: b)).map { ($0.index, $0.share / 2) }
+    }
+
+    /// §6.3 of the paper: if the last step shrank the gap by less than
+    /// ε·gap the iterate is zig-zagging, so the midpoint of the two most
+    /// frequently used pivots joins the pivot set. Returns the explanation
+    /// and the new point when a midpoint was added, nil otherwise.
+    private mutating func addMidpointIfZigZagging() -> (text: String, pivot: AddedPivot)? {
+        guard let previousGap, gap > 0 else { return nil }
+        let shrink = previousGap - gap
+        guard shrink < Self.zigZagTolerance * gap else { return nil }
+        // Most-used pivots first; ties broken by index so runs are repeatable.
+        let ranked = pivotUses.sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }.map(\.key)
+        guard ranked.count >= 2 else { return nil }
+        // The midpoint of the top two is the paper's choice. If it already
+        // exists (the zig-zag persisted), fall through to the next pair among
+        // the three most-used pivots so the heuristic can keep refining.
+        let top = Array(ranked.prefix(3))
+        for i in top.indices {
+            for j in top.indices where j > i {
+                let (a, b) = (top[i], top[j])
+                let pa = pivotPoint(a), pb = pivotPoint(b)
+                let m = CGPoint(x: (pa.x + pb.x) / 2, y: (pa.y + pb.y) / 2)
+                guard !extraPivots.contains(where: { distance($0.point, m) < 1e-6 }) else { continue }
+                extraPivots.append((m, (a, b)))
+                let name = pivotName(vertices.count + extraPivots.count - 1)
+                let percent = Int(Self.zigZagTolerance * 100)
+                let text = "The last step shrank the gap by only \(lengthText(shrink)), under \(percent)% of the remaining \(lengthText(gap)) — the iterate is zig-zagging. The midpoint \(name) of \(pivotName(a)) and \(pivotName(b)), the two most-used pivots, joins the pivot set. "
+                return (text, AddedPivot(name: name, point: m, parents: [pa, pb]))
+            }
+        }
+        return nil
     }
 
     // MARK: Explanations
@@ -319,12 +405,16 @@ nonisolated struct StepSolver {
 
     /// Why the greedy TA pivot qualifies and why it won the scan.
     private func towardReason(_ toward: Candidate, validCount: Int) -> String {
-        let index = toward.receivers[0]
-        let name = vertexName(index)
-        let v = vertices[index]
+        let index = toward.pivotIndex ?? toward.receivers[0]
+        var name = pivotName(index)
+        if index >= vertices.count {
+            let (a, b) = extraPivots[index - vertices.count].parents
+            name += ", the midpoint of \(pivotName(a)) and \(pivotName(b)),"
+        }
+        let v = pivotPoint(index)
         var text = "\(name) is a valid pivot: it is at least as far from the iterate (\(lengthText(distance(x, v)))) as from p (\(lengthText(distance(target, v))))."
         text += validCount > 1
-            ? " Of \(validCount) valid pivots, sliding along the segment to \(name) lands nearest p: \(gapText(toward))."
+            ? " Of \(validCount) valid pivots, sliding along the segment to \(pivotName(index)) lands nearest p: \(gapText(toward))."
             : " It is the only valid pivot: \(gapText(toward))."
         return text
     }
@@ -346,53 +436,41 @@ nonisolated struct StepSolver {
         weights.indices.filter { weights[$0] > Self.supportThreshold }
     }
 
-    /// The classic TA step toward vertex `index`, if it is a valid pivot.
+    /// The classic TA step toward pivot `index`, if it is a valid pivot. The
+    /// index may name a vertex or, under the midpoint heuristic, an added
+    /// midpoint; a step toward a midpoint is a `.midpoint` step whose
+    /// receivers are the midpoint's two parents.
     private func toward(_ index: Int) -> Candidate? {
-        let v = vertices[index]
+        let v = pivotPoint(index)
         guard distance(x, v) >= distance(target, v),
               let search = lineSearch(from: x, direction: CGPoint(x: v.x - x.x, y: v.y - x.y),
                                       target: target, maxStep: 1) else { return nil }
-        return Candidate(kind: .toward, next: search.next, gain: search.gain, endpoint: v,
-                         receivers: [index], donors: [],
-                         update: .blend(gamma: search.gamma, shares: [(index, 1)]))
+        let isMidpoint = index >= vertices.count
+        let receivers: [Int]
+        if isMidpoint {
+            let (a, b) = extraPivots[index - vertices.count].parents
+            receivers = [a, b]
+        } else {
+            receivers = [index]
+        }
+        return Candidate(kind: isMidpoint ? .midpoint : .toward, next: search.next, gain: search.gain,
+                         endpoint: v, receivers: receivers, donors: [],
+                         update: .blend(gamma: search.gamma, shares: vertexShares(of: index)),
+                         pivotIndex: index)
     }
 
-    /// The greedy TA pivot: among valid pivots, the one whose segment
-    /// projection lands nearest p (the largest gain), plus how many
-    /// vertices qualified.
+    /// The greedy TA pivot: among valid pivots (vertices plus any added
+    /// midpoints), the one whose segment projection lands nearest p (the
+    /// largest gain), plus how many qualified.
     private func towardScan() -> (best: Candidate?, validCount: Int) {
         var best: Candidate? = nil
         var validCount = 0
-        for index in vertices.indices {
+        for index in 0..<(vertices.count + extraPivots.count) {
             guard let candidate = toward(index) else { continue }
             validCount += 1
             if candidate.gain > (best?.gain ?? 0) { best = candidate }
         }
         return (best, validCount)
-    }
-
-    /// Pivot on the midpoint of the two best valid pivots. The midpoint is
-    /// a convex combination, so the segment to it stays inside the hull.
-    private func midpointCandidate() -> Candidate? {
-        var first: Candidate? = nil
-        var second: Candidate? = nil
-        for index in vertices.indices {
-            guard let candidate = toward(index) else { continue }
-            if candidate.gain > (first?.gain ?? 0) {
-                second = first
-                first = candidate
-            } else if candidate.gain > (second?.gain ?? 0) {
-                second = candidate
-            }
-        }
-        guard let r1 = first?.receivers.first, let r2 = second?.receivers.first else { return nil }
-        let a = vertices[r1], b = vertices[r2]
-        let m = CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2)
-        guard let search = lineSearch(from: x, direction: CGPoint(x: m.x - x.x, y: m.y - x.y),
-                                      target: target, maxStep: 1) else { return nil }
-        return Candidate(kind: .midpoint, next: search.next, gain: search.gain, endpoint: m,
-                         receivers: [r1, r2], donors: [],
-                         update: .blend(gamma: search.gamma, shares: [(r1, 0.5), (r2, 0.5)]))
     }
 
     /// Step straight away from `donor`: x + γ(x − u), γ ≤ α_u / (1 − α_u).
