@@ -277,7 +277,7 @@
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
 				MARKETING_VERSION = 1.2;
-				PRODUCT_BUNDLE_IDENTIFIER = com.bahmankalantari.triangulography;
+				PRODUCT_BUNDLE_IDENTIFIER = com.bahmankalantari.triangletrace;
 				PRODUCT_NAME = Triangulography;
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;
@@ -322,7 +322,7 @@
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
 				MARKETING_VERSION = 1.2;
-				PRODUCT_BUNDLE_IDENTIFIER = com.bahmankalantari.triangulography;
+				PRODUCT_BUNDLE_IDENTIFIER = com.bahmankalantari.triangletrace;
 				PRODUCT_NAME = Triangulography;
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;
