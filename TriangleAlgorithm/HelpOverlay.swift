@@ -25,7 +25,7 @@ struct HelpOverlay: View {
                         row(icon: "square.grid.2x2", title: "Pick a mode",
                             detail: "Learn traces one path in a triangle, slowly, pointing out each pivot vertex. Studio traces many starting iterates at once; its coloring button switches between plain paths, palette-filled regions between them, and an iteration-intensity gradient over the hull.")
                         row(icon: "hand.tap", title: "Build a hull",
-                            detail: "Tap the canvas to drop points — you need at least three. Drag any dot to reshape the hull; the buttons below undo or clear.")
+                            detail: "Tap the canvas to drop points — you need at least three. Drag any dot to reshape the hull; Clear all points under ⋯ starts the hull over.")
                         row(icon: "circlebadge.fill", title: "Place the target",
                             detail: "Drag the dot anywhere on the canvas. The app tests whether that point lies inside the hull.")
                         row(icon: "play.fill", title: "Run",
@@ -43,7 +43,7 @@ struct HelpOverlay: View {
                         row(icon: "square.grid.3x3.topleft.filled", title: "Shape the iterates",
                             detail: "With Plain paths or Palette slices, choose how the starting iterates are laid out — border, ring, spiral, random — or edit them by hand. They always live inside the hull. Iteration intensity samples its own grid instead.")
                         row(icon: "sparkles", title: "And more",
-                            detail: "The shapes menu drops a square, circle, ellipse, diamond, pentagon, hexagon, star, or random example onto the canvas; ambient mode composes endlessly until you tap, and the share button exports your run as a poster.")
+                            detail: "The shapes menu drops a square, circle, ellipse, diamond, pentagon, hexagon, star, or random example onto the canvas; ambient mode composes endlessly until you tap, and the share button exports your run as a poster. Lost? The ↺ restart button clears the canvas and puts every setting back to its default.")
                     }
                     .padding(24)
                 }

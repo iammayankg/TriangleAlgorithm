@@ -1,7 +1,7 @@
 import SwiftUI
 import Photos
 
-@main struct TriangleTraceApp: App {
+@main struct TriangulographyApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
@@ -27,6 +27,7 @@ struct TraceCommands {
     var undo: () -> Void
     var clearEnabled: Bool
     var clearAll: () -> Void
+    var restart: () -> Void
     var randomExample: () -> Void
     var ambient: () -> Void
     var openSettings: () -> Void
@@ -73,12 +74,15 @@ struct TraceMenuCommands: Commands {
             Button("Clear All Points") { commands?.clearAll() }
                 .keyboardShortcut(.delete)
                 .disabled(commands?.clearEnabled != true)
+            Button("Restart…") { commands?.restart() }
+                .keyboardShortcut(.delete, modifiers: [.command, .shift])
+                .disabled(commands == nil)
             Divider()
             Button("Ambient Mode") { commands?.ambient() }
                 .disabled(commands == nil)
         }
         CommandGroup(replacing: .help) {
-            Button("TriangleTrace Help") { commands?.openHelp() }
+            Button("Triangulography Help") { commands?.openHelp() }
                 .keyboardShortcut("?")
                 .disabled(commands == nil)
         }
@@ -595,6 +599,8 @@ struct ContentView: View {
     @AppStorage("hullLineWidth") private var hullLineWidth = 3.0
     @AppStorage("pointMarkerSize") private var pointMarkerSize = 6.0
     @State private var showSettings = false
+    /// Asks before Restart wipes the canvas and resets every setting.
+    @State private var showRestartConfirmation = false
     /// Basic mode's "why this pivot" card; dismissed per run, back on the next.
     @State private var showPivotExplanation = true
     /// Basic mode: reveal the trace one step per tap instead of on a timer.
@@ -630,6 +636,14 @@ struct ContentView: View {
     /// Basic mode traces slowly enough to follow each pivot; the other
     /// modes favor a lively composition.
     private var stepsPerSecond: Double { mode == .basic ? 1.6 : 7 }
+
+    /// The schedule the current run plays on: the base pace for its opening
+    /// steps, then an accelerated tail so a run that zig-zags to the
+    /// iteration cap finishes in seconds instead of looking frozen.
+    private var runTimeline: RunTimeline {
+        let maxPoints = trajectories.map(\.points.count).max() ?? 0
+        return RunTimeline(stepCount: max(maxPoints - 1, 0), stepsPerSecond: stepsPerSecond)
+    }
     private let grabRadius: CGFloat = 30
 
     private var hasRun: Bool { !trajectories.isEmpty }
@@ -738,15 +752,10 @@ struct ContentView: View {
             return inside ? .success : .error
         }
         .task(id: runStart) {
-            // Stop the timeline once the longest trajectory has fully traced.
-            // Clamped to the score's cap so a run that hit the iteration
-            // limit jumps to its finished picture when the audio ends
-            // instead of animating for minutes past it.
+            // Stop the animation once the longest trajectory has fully
+            // traced; the timeline bounds even a cap-hitting run to seconds.
             guard runStart != nil, isAnimating else { return }
-            let maxSteps = trajectories.map(\.points.count).max() ?? 0
-            let duration = min(Double(max(maxSteps - 1, 0)) / stepsPerSecond + 0.4,
-                               SoundEngine.maxScoreDuration)
-            try? await Task.sleep(for: .seconds(duration))
+            try? await Task.sleep(for: .seconds(runTimeline.duration + 0.4))
             withAnimation(.spring(duration: 0.4)) { isAnimating = false }
         }
         .task(id: isAmbient) {
@@ -754,11 +763,8 @@ struct ContentView: View {
             guard isAmbient else { return }
             while isAmbient && !Task.isCancelled {
                 randomExample()
-                let maxSteps = trajectories.map(\.points.count).max() ?? 0
-                let traceDuration = min(Double(max(maxSteps - 1, 0)) / stepsPerSecond + 0.4,
-                                        SoundEngine.maxScoreDuration)
                 // Let the finished composition hang on screen before repainting.
-                try? await Task.sleep(for: .seconds(traceDuration + 3.5))
+                try? await Task.sleep(for: .seconds(runTimeline.duration + 0.4 + 3.5))
             }
         }
         .sensoryFeedback(.warning, trigger: outsideHullWarningNonce)
@@ -964,6 +970,7 @@ struct ContentView: View {
             undo: undo,
             clearEnabled: !hullPoints.isEmpty || hasRun,
             clearAll: clearAll,
+            restart: { showRestartConfirmation = true },
             randomExample: randomExample,
             ambient: {
                 tutorialStep = nil
@@ -1431,7 +1438,7 @@ struct ContentView: View {
     private func focusedStepIndex(at date: Date, stepCount: Int) -> Int {
         guard stepCount > 0 else { return 0 }
         if isAnimating, let start = runStart {
-            let progress = max(0, date.timeIntervalSince(start)) * stepsPerSecond
+            let progress = runTimeline.progress(at: date.timeIntervalSince(start))
             return min(max(Int(progress), 0), stepCount - 1)
         }
         return min(max(reviewedStep, 0), stepCount - 1)
@@ -1671,7 +1678,7 @@ struct ContentView: View {
             Image(systemName: "info")
         }
         .glassButton(inToolbar: inToolbar)
-        .accessibilityLabel("About the Triangle Algorithm")
+        .accessibilityLabel("About Triangulography")
         .popover(isPresented: $showInfo) {
             infoContent
                 .keepPopoverCompact()
@@ -1687,10 +1694,17 @@ struct ContentView: View {
 
     private var infoText: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Kalantari's Triangle Algorithm")
+            Text("About Triangulography")
                 .font(.headline)
-            Text("Iterates start from a configurable set of points inside the convex hull — evenly spaced along its border by default. Each step finds a pivot vertex v with d(x, v) ≥ d(p, v) and jumps to the point on the segment [x, v] closest to the target p.")
-            Text("If an iterate gets within ε of the target, the point is in the hull. If no pivot exists, the iterate is a witness — proof the point is outside.")
+            Text("The Triangulography app is based on Kalantari's Triangle Algorithm, which addresses a simple geometric question: Does a given point p lie in the convex hull of a set of n given points v₁, v₂, …, vₙ?")
+            Text("To picture the convex hull, imagine hammering a nail into a flat board at each of the given points. Stretch a rubber band around all the nails, then let it tighten. The band wraps snugly around the outermost nails, keeping every nail inside or on the band. The rubber band and the entire region inside it form the convex hull of the points.")
+            Text("Now imagine that p is the villain's location and p′ is Spider-Man's current position. Spider-Man can start anywhere inside or on the boundary of the convex hull. He cannot move directly toward the villain. Instead, he must use one of the given points as a pivot to move closer. A point v qualifies as a pivot if its distance from Spider-Man's current position p′ is at least its distance from the villain's location p.")
+            Text("Once he chooses a pivot v, Spider-Man shoots a web to it and pulls himself along the line segment from p′ to v, stopping at the point closest to the villain. This becomes his new position, and he repeats the process.")
+            Text("If the villain lies in the convex hull, Spider-Man can get as close to him as desired. However, if at any stage Spider-Man cannot find a pivot, his current position becomes a witness that the villain lies outside the convex hull and is beyond his reach.")
+            Text("The same algorithm works in any dimension. In this app, we work in two dimensions so that we can visualize the movements and turn them into art. Connecting Spider-Man's successive positions traces a path, and different starting positions can produce different paths.")
+            Text("If progress becomes too slow, we can introduce additional points to use as pivots, such as the midpoints of pairs of the original points. These new points lie within the existing convex hull, so adding them does not change it.")
+            Text("One way to create art is to choose several starting positions and draw the corresponding paths. Where these paths intersect, they can enclose regions that we color. Different starting positions, pivot choices, and coloring schemes offer many possibilities for creating geometric art.")
+            Text("The app allows you to select the points as you wish by tapping the screen. It also allows you to select preselected points on specific shapes such as star, square, circle, ellipse, diamond, hexagon.")
             Divider()
             Text("Intensity plot")
                 .font(.headline)
@@ -1836,7 +1850,7 @@ struct ContentView: View {
                 Button(action: runOrStop) {
                     Label(busy ? "Stop" : hasResult ? "Replay" : "Run",
                           systemImage: busy ? "stop.fill" : hasResult ? "arrow.clockwise" : "play.fill")
-                        .frame(minWidth: 90)
+                        .frame(minWidth: 70)
                 }
                 .buttonStyle(.glassProminent)
                 .disabled(!busy && runDisabled)
@@ -1850,12 +1864,21 @@ struct ContentView: View {
                     shapeMenu
                 }
 
-                Button(action: undo) {
-                    Image(systemName: "arrow.uturn.backward")
+                // A way out for a user who has lost track of the modes,
+                // strategies, and colorings: back to a blank first launch.
+                Button {
+                    showRestartConfirmation = true
+                } label: {
+                    Image(systemName: "arrow.counterclockwise")
                 }
                 .buttonStyle(.glass)
-                .disabled(isEditingIterates ? startPoints.isEmpty : hullPoints.isEmpty)
-                .accessibilityLabel(isEditingIterates ? "Undo last iterate" : "Undo last point")
+                .accessibilityLabel("Restart from scratch")
+                .confirmationDialog("Restart from scratch?", isPresented: $showRestartConfirmation, titleVisibility: .visible) {
+                    Button("Restart", role: .destructive, action: restart)
+                    Button("Cancel", role: .cancel) { }
+                } message: {
+                    Text("Clears the canvas and returns every mode, strategy, coloring, and appearance setting to its default.")
+                }
 
                 moreMenu
             }
@@ -2321,7 +2344,7 @@ struct ContentView: View {
             let gaps = trajectory.points.map { min(1, Double(distance($0, p) / initialGap)) }
             return SoundEngine.Voice(gaps: gaps, converged: trajectory.converged)
         }
-        soundEngine.play(voices: voices, stepsPerSecond: stepsPerSecond)
+        soundEngine.play(voices: voices, timeline: runTimeline)
     }
 
     /// Ends the trace playback early: the fully traced composition and the
@@ -2387,6 +2410,45 @@ struct ContentView: View {
         if canvasSize != .zero {
             queryPoint = CGPoint(x: canvasSize.width / 2, y: canvasSize.height / 2)
         }
+    }
+
+    /// Returns the app to the state it had on first launch: an empty canvas
+    /// with every mode, strategy, coloring, and appearance choice back at its
+    /// default. The custom palette's colors and the "seen help" flag are the
+    /// only things kept — both are the user's own work, not navigation state.
+    private func restart() {
+        // Leave whatever is on top of the canvas first.
+        tutorialStep = nil
+        isAmbient = false
+        showSettings = false
+        showPaletteEditor = false
+        showInfo = false
+        showHelp = false
+        isSavingToPhotos = false
+        didSaveToPhotos = false
+        // Mode and algorithm choices.
+        mode = .basic
+        coloringMode = .paths
+        stepStrategy = .toward
+        blockSize = 4
+        iterateScheme = .border
+        iterateCount = 8
+        manualStepping = false
+        revealedSteps = 0
+        reviewedStep = 0
+        showPivotExplanation = true
+        // Appearance and trace options.
+        palette = .mondrian
+        paintColor = .orange
+        trajectoryLineWidth = 4.0
+        hullLineWidth = 3.0
+        pointMarkerSize = 6.0
+        showBisector = false
+        soundOn = true
+        showChips = false
+        exportResolution = .high
+        // Finally the canvas itself: points, iterates, fields, and sound.
+        clearAll()
     }
 
     private func randomExample() {
@@ -2643,7 +2705,7 @@ struct ContentView: View {
 
             ShareLink(
                 item: poster.image,
-                preview: SharePreview("TriangleTrace — \(palette.name)", image: poster.image)
+                preview: SharePreview("Triangulography — \(palette.name)", image: poster.image)
             ) {
                 Label("Share poster", systemImage: "square.and.arrow.up")
                     .frame(minWidth: 160)
@@ -2675,7 +2737,7 @@ struct ContentView: View {
         .alert("Couldn't save to Photos", isPresented: $showSaveFailedAlert) {
             Button("OK", role: .cancel) { }
         } message: {
-            Text("Allow photo library access for TriangleTrace in Settings and try again.")
+            Text("Allow photo library access for Triangulography in Settings and try again.")
         }
     }
 
@@ -2707,7 +2769,7 @@ struct ContentView: View {
     private func draw(in context: inout GraphicsContext, size: CGSize, at date: Date) {
         let progress: Double
         if isAnimating, let start = runStart {
-            progress = max(0, date.timeIntervalSince(start)) * stepsPerSecond
+            progress = runTimeline.progress(at: date.timeIntervalSince(start))
         } else if isManualRun {
             progress = Double(min(revealedSteps, totalSteps))
         } else {

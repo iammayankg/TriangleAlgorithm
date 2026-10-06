@@ -7,7 +7,7 @@
 	objects = {
 
 /* Begin PBXFileReference section */
-		000000000000000000000120 /* TriangleTrace.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TriangleTrace.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		000000000000000000000120 /* Triangulography.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Triangulography.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -38,7 +38,7 @@
 		000000000000000000000020 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				000000000000000000000120 /* TriangleTrace.app */,
+				000000000000000000000120 /* Triangulography.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -61,7 +61,7 @@
 			);
 			name = TriangleAlgorithm;
 			productName = MyApp;
-			productReference = 000000000000000000000120 /* TriangleTrace.app */;
+			productReference = 000000000000000000000120 /* Triangulography.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -260,8 +260,8 @@
 				ENABLE_RESOURCE_ACCESS_PHOTO_LIBRARY = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_CFBundleDisplayName = "Triangle Algorithm";
-				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "TriangleTrace saves your finished posters to your photo library.";
+				INFOPLIST_KEY_CFBundleDisplayName = Triangulography;
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "Triangulography saves your finished posters to your photo library.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -277,8 +277,8 @@
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
 				MARKETING_VERSION = 1.2;
-				PRODUCT_BUNDLE_IDENTIFIER = com.bahmankalantari.triangletrace;
-				PRODUCT_NAME = TriangleTrace;
+				PRODUCT_BUNDLE_IDENTIFIER = com.bahmankalantari.triangulography;
+				PRODUCT_NAME = Triangulography;
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -305,8 +305,8 @@
 				ENABLE_RESOURCE_ACCESS_PHOTO_LIBRARY = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_CFBundleDisplayName = "Triangle Algorithm";
-				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "TriangleTrace saves your finished posters to your photo library.";
+				INFOPLIST_KEY_CFBundleDisplayName = Triangulography;
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "Triangulography saves your finished posters to your photo library.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -322,8 +322,8 @@
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
 				MARKETING_VERSION = 1.2;
-				PRODUCT_BUNDLE_IDENTIFIER = com.bahmankalantari.triangletrace;
-				PRODUCT_NAME = TriangleTrace;
+				PRODUCT_BUNDLE_IDENTIFIER = com.bahmankalantari.triangulography;
+				PRODUCT_NAME = Triangulography;
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;

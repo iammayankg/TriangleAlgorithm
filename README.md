@@ -1,4 +1,4 @@
-# TriangleTrace
+# Triangulography
 
 An interactive SwiftUI visualization of **Kalantari's Triangle Algorithm** — a simple iterative method for deciding whether a point lies inside the convex hull of a set of points — rendered in the style of a Mondrian composition.
 
