@@ -23,8 +23,6 @@ struct TraceCommands {
     var runTitle: String
     var runEnabled: Bool
     var run: () -> Void
-    var undoEnabled: Bool
-    var undo: () -> Void
     var clearEnabled: Bool
     var clearAll: () -> Void
     var restart: () -> Void
@@ -46,7 +44,7 @@ extension FocusedValues {
 }
 
 /// Menu bar items with the shortcuts a Mac (or iPad with a keyboard)
-/// user expects: Run/Stop, Undo, Clear, Settings, and Help.
+/// user expects: Run/Stop, Clear, Restart, Settings, and Help.
 struct TraceMenuCommands: Commands {
     @FocusedValue(\.traceCommands) private var commands
 
@@ -56,9 +54,8 @@ struct TraceMenuCommands: Commands {
                 .keyboardShortcut(",")
                 .disabled(commands == nil)
         }
-        // The canvas has its own notion of undo (the last placed point);
-        // the stock Undo/Redo items would be dead, so the Trace menu
-        // takes over the shortcut.
+        // The canvas has no document-style undo, so the stock Undo/Redo
+        // items would be dead; drop them rather than show disabled items.
         CommandGroup(replacing: .undoRedo) { }
         CommandMenu("Trace") {
             Button(commands?.runTitle ?? "Run") { commands?.run() }
@@ -68,9 +65,6 @@ struct TraceMenuCommands: Commands {
                 .keyboardShortcut("r", modifiers: [.command, .shift])
                 .disabled(commands == nil)
             Divider()
-            Button("Undo Last Point") { commands?.undo() }
-                .keyboardShortcut("z")
-                .disabled(commands?.undoEnabled != true)
             Button("Clear All Points") { commands?.clearAll() }
                 .keyboardShortcut(.delete)
                 .disabled(commands?.clearEnabled != true)
@@ -212,6 +206,10 @@ struct Trajectory: Identifiable {
     /// to `points[i + 1]`, naming the vertices it moved toward or away from.
     let steps: [TraceStep]
     let outcome: TraceOutcome
+    /// Launched from a point of S inside the hull rather than from one of
+    /// the scheme's iterates. Drawn like the others, but left out of the
+    /// wedge fills, whose order follows the iterates around the hull.
+    var fromInteriorPoint = false
     var converged: Bool { outcome == .converged }
     /// The vertex called out as each step's pivot.
     var pivots: [CGPoint] { steps.map(\.pivot) }
@@ -595,6 +593,9 @@ struct ContentView: View {
     /// Pairs per scan for the guarded block strategy.
     @AppStorage("blockSize") private var blockSize = 4
     @AppStorage("iterateCount") private var iterateCount = 8
+    /// Studio: points of S that aren't hull corners launch their own
+    /// trajectories, so no point sits idle on the canvas.
+    @AppStorage("traceInteriorPoints") private var traceInteriorPoints = true
     @AppStorage("trajectoryLineWidth") private var trajectoryLineWidth = 4.0
     @AppStorage("hullLineWidth") private var hullLineWidth = 3.0
     @AppStorage("pointMarkerSize") private var pointMarkerSize = 6.0
@@ -647,6 +648,11 @@ struct ContentView: View {
     private let grabRadius: CGFloat = 30
 
     private var hasRun: Bool { !trajectories.isEmpty }
+
+    /// The trajectories the palette's wedges are built between: the
+    /// scheme's iterates in order around the hull. Trajectories from
+    /// interior points of S are drawn but take no part in the fills.
+    private var wedgeTrajectories: [Trajectory] { trajectories.filter { !$0.fromInteriorPoint } }
 
     /// Steps in Basic mode's single trace.
     private var totalSteps: Int { trajectories.first?.steps.count ?? 0 }
@@ -938,6 +944,10 @@ struct ContentView: View {
         .onChange(of: blockSize) { _, _ in
             if hasResult, stepStrategy == .block { recompute(animated: false) }
         }
+        .onChange(of: traceInteriorPoints) { _, _ in
+            // Add or drop the interior points' paths on the finished picture.
+            if hasRun, mode == .paths { recompute(animated: false) }
+        }
         .alert("Add hull points first", isPresented: $showAddHullPointsAlert) {
             Button("OK", role: .cancel) { }
         } message: {
@@ -966,8 +976,6 @@ struct ContentView: View {
             runTitle: isAnimating || isBuildingField ? "Stop" : hasResult ? "Replay" : "Run",
             runEnabled: isAnimating || isBuildingField || !runDisabled,
             run: runOrStop,
-            undoEnabled: isEditingIterates ? !startPoints.isEmpty : !hullPoints.isEmpty,
-            undo: undo,
             clearEnabled: !hullPoints.isEmpty || hasRun,
             clearAll: clearAll,
             restart: { showRestartConfirmation = true },
@@ -1066,10 +1074,13 @@ struct ContentView: View {
                     Toggle(isOn: $showChips) {
                         Label("Status chips", systemImage: "capsule")
                     }
+                    Toggle(isOn: $traceInteriorPoints) {
+                        Label("Interior points trace", systemImage: "point.3.filled.connected.trianglepath.dotted")
+                    }
                 } header: {
                     Text("Trace")
                 } footer: {
-                    Text("Status chips show the membership verdict with its iteration count, Learn mode's step summary, and progress while tracing or building a field. Each can also be hidden with its ×.")
+                    Text("Status chips show the membership verdict with its iteration count, Learn mode's step summary, and progress while tracing or building a field. Each can also be hidden with its ×. In Studio, points of S that aren't corners of the hull trace their own paths alongside the chosen iterates; they stay out of the palette's wedge fills.")
                 }
                 Section {
                     VStack(alignment: .leading) {
@@ -2164,6 +2175,8 @@ struct ContentView: View {
             var counts = [Int](repeating: -1, count: columns * rows)
             var maxCount = 1
             let batchRows = 6
+            var lastPublish = ContinuousClock.now
+            let publishInterval: Duration = .milliseconds(16)
             for batchStart in stride(from: 0, to: rows, by: batchRows) {
                 let batchEnd = min(batchStart + batchRows, rows)
                 for row in batchStart..<batchEnd {
@@ -2179,6 +2192,15 @@ struct ContentView: View {
                     }
                 }
                 if Task.isCancelled { return }
+                // Small or coarse grids finish several batches within one
+                // frame; publishing each would update the glass progress
+                // chip multiple times per frame, which Liquid Glass flags
+                // as a fault. Publish at most once per frame, plus the
+                // final batch so the result always lands.
+                let isLastBatch = batchEnd == rows
+                let now = ContinuousClock.now
+                guard isLastBatch || now - lastPublish >= publishInterval else { continue }
+                lastPublish = now
                 let partial = IterationField(cellSize: cellSize, columns: columns,
                                              rows: rows, counts: counts, maxCount: maxCount)
                 let progress = Double(batchEnd) / Double(rows)
@@ -2243,6 +2265,8 @@ struct ContentView: View {
             var counts = [Int](repeating: -1, count: columns * rows)
             var maxCount = 1
             let batchRows = max(6, rows / 12 + 1)
+            var lastPublish = ContinuousClock.now
+            let publishInterval: Duration = .milliseconds(16)
             for batchStart in stride(from: 0, to: rows, by: batchRows) {
                 let batchEnd = min(batchStart + batchRows, rows)
                 for row in batchStart..<batchEnd {
@@ -2258,6 +2282,11 @@ struct ContentView: View {
                     }
                 }
                 if Task.isCancelled { return }
+                // Same once-per-frame throttle as the intensity field.
+                let isLastBatch = batchEnd == rows
+                let now = ContinuousClock.now
+                guard isLastBatch || now - lastPublish >= publishInterval else { continue }
+                lastPublish = now
                 let partial = IterationField(cellSize: cellSize, columns: columns,
                                              rows: rows, counts: counts, maxCount: maxCount)
                 let progress = Double(batchEnd) / Double(rows)
@@ -2306,6 +2335,22 @@ struct ContentView: View {
                                                  strategy: stepStrategy, blockSize: blockSize)
             return Trajectory(points: result.points, steps: result.steps, outcome: result.outcome)
         }
+        // Points of S inside the hull (or on an edge without being a corner)
+        // never shape the outline and are rarely chosen as pivots, so they
+        // would sit idle. In Studio each one launches its own trajectory,
+        // unless an iterate already starts there (as with Points of S).
+        if mode == .paths, traceInteriorPoints {
+            let hull = convexHull(of: hullPoints)
+            let interior = hullPoints.filter { point in
+                !hull.contains(point) && !startPoints.contains { distance($0, point) < 0.5 }
+            }
+            trajectories += interior.map { start in
+                let result = TriangleAlgorithm.trace(from: start, vertices: hullPoints, target: p,
+                                                     strategy: stepStrategy, blockSize: blockSize)
+                return Trajectory(points: result.points, steps: result.steps, outcome: result.outcome,
+                                  fromInteriorPoint: true)
+            }
+        }
         rebuildIterationField(coarse: activeDrag != nil)
         if animated, mode == .basic, manualStepping {
             // Manual stepping: nothing moves until the user asks for the
@@ -2352,32 +2397,6 @@ struct ContentView: View {
     private func stopTrace() {
         withAnimation(.spring(duration: 0.4)) { isAnimating = false }
         soundEngine.stop()
-    }
-
-    private func undo() {
-        if isEditingIterates {
-            guard !startPoints.isEmpty else { return }
-            startPoints.removeLast()
-            iterateScheme = .custom
-            if startPoints.isEmpty {
-                trajectories = []
-                runStart = nil
-                isAnimating = false
-            } else if hasRun {
-                recompute(animated: false)
-            }
-            return
-        }
-        guard !hullPoints.isEmpty else { return }
-        hullPoints.removeLast()
-        syncIteratesToHull()
-        if hullPoints.isEmpty || startPoints.isEmpty {
-            trajectories = []
-            runStart = nil
-            isAnimating = false
-        } else if hasRun {
-            recompute(animated: false)
-        }
     }
 
     /// Empties the iterate set so the user can place a fresh one by hand.
@@ -2446,6 +2465,7 @@ struct ContentView: View {
         showBisector = false
         soundOn = true
         showChips = false
+        traceInteriorPoints = true
         exportResolution = .high
         // Finally the canvas itself: points, iterates, fields, and sound.
         clearAll()
@@ -3117,6 +3137,7 @@ struct ContentView: View {
     /// always share a screen edge, so closing the subpath runs straight
     /// along the border).
     private func drawMondrianRegions(in context: inout GraphicsContext, size: CGSize, upTo progress: Double) {
+        let trajectories = wedgeTrajectories
         let n = trajectories.count
         guard hasRun, n >= 2 else { return }
 
@@ -3145,6 +3166,7 @@ struct ContentView: View {
     /// The region between trajectory `i` and its neighbor, as drawn by
     /// `drawMondrianRegions` — shared by drawing and wedge hit-testing.
     private func wedgePath(_ i: Int, upTo progress: Double = .infinity) -> Path? {
+        let trajectories = wedgeTrajectories
         let n = trajectories.count
         guard n >= 2 else { return nil }
         let a = revealedPoints(trajectories[i].points, upTo: progress)
@@ -3161,6 +3183,7 @@ struct ContentView: View {
     /// The wedge under `location`, checking the visually topmost first:
     /// painted wedges sit above accents, which sit above neutrals.
     private func wedgeIndex(at location: CGPoint) -> Int? {
+        let trajectories = wedgeTrajectories
         let n = trajectories.count
         guard n >= 2 else { return nil }
         let order = trajectories.indices.sorted { paletteSlice($0).isNeutral && !paletteSlice($1).isNeutral }
